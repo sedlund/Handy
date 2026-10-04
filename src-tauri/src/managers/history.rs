@@ -357,10 +357,14 @@ impl HistoryManager {
 
         for (id, file_name) in entries {
             // Delete database entry
-            conn.execute(
+            let deleted = conn.execute(
                 "DELETE FROM transcription_history WHERE id = ?1",
                 params![id],
             )?;
+            if deleted == 0 {
+                continue;
+            }
+            deleted_count += deleted;
 
             // Delete WAV file
             let file_path = self.recordings_dir.join(file_name);
@@ -369,8 +373,13 @@ impl HistoryManager {
                     error!("Failed to delete WAV file {}: {}", file_name, e);
                 } else {
                     debug!("Deleted old WAV file: {}", file_name);
-                    deleted_count += 1;
                 }
+            }
+
+            // Cleanup must notify open History views just like a manual delete,
+            // including when the recording was already missing from disk.
+            if let Err(e) = (HistoryUpdatePayload::Deleted { id: *id }).emit(&self.app_handle) {
+                error!("Failed to emit history-updated event: {}", e);
             }
         }
 

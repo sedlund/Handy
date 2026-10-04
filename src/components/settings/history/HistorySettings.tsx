@@ -141,9 +141,12 @@ export const HistorySettings: React.FC = () => {
         setEntries((prev) =>
           prev.map((e) => (e.id === payload.entry.id ? payload.entry : e)),
         );
+      } else if (payload.action === "deleted") {
+        // Remove in place so cleanup keeps loaded pages and scroll anchoring.
+        // Filtering twice is harmless when a manual delete was optimistic.
+        setEntries((prev) => prev.filter((e) => e.id !== payload.id));
       }
-      // "deleted" and "toggled" are handled by optimistic updates only,
-      // so we intentionally ignore them here to avoid double-mutation.
+      // "toggled" stays optimistic: applying it again would undo the toggle.
     });
 
     return () => {
