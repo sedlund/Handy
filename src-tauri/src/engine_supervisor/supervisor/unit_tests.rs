@@ -438,3 +438,25 @@ fn deadlines_scale_with_the_audio_above_a_floor() {
     assert_eq!(ms_to_samples(1500), 24_000);
     assert_eq!(ms_to_samples(-5), 0);
 }
+
+#[test]
+fn device_status_publishes_before_inference_and_ignores_pending_unloads() {
+    let changes = Arc::new(Mutex::new(Vec::new()));
+    let observed = changes.clone();
+    let mut owner = policy_owner();
+    owner.shared = Arc::new(Shared {
+        gpu_allowed: true,
+        on_device_changed: Some(Box::new(move |info| {
+            lock(&observed).push(info.device.clone());
+        })),
+        ..Shared::default()
+    });
+    assert!(owner.publish_loaded(&loaded(None)));
+    assert!(owner.publish_loaded(&loaded(Some("amd"))));
+    assert_eq!(*lock(&changes), vec!["CPU", "amd"]);
+    assert_eq!(lock(&owner.shared.loaded).as_ref().unwrap().device, "amd");
+    // An unload requested before a load finishes must not publish stale status.
+    owner.shared.unloads_requested.store(1, Ordering::SeqCst);
+    assert!(!owner.publish_loaded(&loaded(Some("nvidia"))));
+    assert_eq!(*lock(&changes), vec!["CPU", "amd"]);
+}

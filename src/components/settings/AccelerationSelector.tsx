@@ -118,9 +118,14 @@ export const AccelerationSelector: FC<AccelerationSelectorProps> = ({
     refreshRef.current = () => {
       void refresh();
     };
-    const fallback = listen("transcription-device-fallback", () => {
-      void refresh();
-    });
+    // Binding changes precede successful inference. Waiting only for the
+    // recovery toast can leave CPU displayed while a returned GPU is in use.
+    const deviceChanges = [
+      "transcription-device-changed",
+      "transcription-device-fallback",
+      "transcription-device-restored",
+      "transcription-device-upgraded",
+    ].map((event) => listen(event, () => void refresh()));
     const modelState = listen<ModelStateEvent>(
       "model-state-changed",
       (event) => {
@@ -133,7 +138,7 @@ export const AccelerationSelector: FC<AccelerationSelectorProps> = ({
         }
       },
     );
-    void Promise.all([fallback, modelState])
+    void Promise.all([...deviceChanges, modelState])
       .then(() => refresh())
       .catch((error) => {
         console.error(
@@ -144,7 +149,7 @@ export const AccelerationSelector: FC<AccelerationSelectorProps> = ({
     return () => {
       disposed = true;
       refreshRef.current = () => {};
-      for (const subscription of [fallback, modelState]) {
+      for (const subscription of [...deviceChanges, modelState]) {
         void subscription.then((unlisten) => unlisten()).catch(console.error);
       }
     };
