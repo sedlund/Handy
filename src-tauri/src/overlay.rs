@@ -17,6 +17,9 @@ use tauri::WebviewUrl;
 #[cfg(target_os = "macos")]
 use tauri_nspanel::{tauri_panel, CollectionBehavior, PanelBuilder, PanelLevel, StyleMask};
 
+#[cfg(target_os = "windows")]
+mod windows_webview;
+
 #[cfg(target_os = "linux")]
 use crate::utils;
 
@@ -439,6 +442,8 @@ pub fn create_recording_overlay(app_handle: &AppHandle) {
                 }
             }
 
+            #[cfg(target_os = "windows")]
+            windows_webview::watch_gpu_process(&window);
             debug!("Recording overlay window created successfully (hidden)");
         }
         Err(e) => {
@@ -508,6 +513,10 @@ fn show_overlay_state(app_handle: &AppHandle, state: &str) {
 }
 
 fn show_overlay_state_on_main(app_handle: &AppHandle, state: &str) {
+    #[cfg(target_os = "windows")]
+    if let Some(window) = app_handle.get_webview_window("recording_overlay") {
+        windows_webview::restore_transparency(&window);
+    }
     // Size the overlay for this state (compact vs. streaming), then position it.
     let (width, height) = overlay_dimensions(state);
     if let Some(overlay_window) = app_handle.get_webview_window("recording_overlay") {
