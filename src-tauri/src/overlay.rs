@@ -507,23 +507,22 @@ fn show_overlay_state(app_handle: &AppHandle, state: &str) {
     // geometry path uniform (a no-op cost on Windows, and it also keeps macOS's
     // NSScreen access main-thread-correct). run_on_main_thread runs the closure
     // inline when already on the main thread, so this never deadlocks.
+    let generation = OVERLAY_VISIBILITY.request();
     let handle = app_handle.clone();
     let state = state.to_string();
-    let _ = app_handle.run_on_main_thread(move || show_overlay_state_on_main(&handle, &state));
+    if let Err(error) = app_handle.run_on_main_thread(move || {
+        if OVERLAY_VISIBILITY.is_current(generation) {
+            show_overlay_state_on_main(&handle, &state);
+        }
+    }) {
+        log::error!("Failed to schedule recording overlay show: {error}");
+    }
 }
 
 fn show_overlay_state_on_main(app_handle: &AppHandle, state: &str) {
-    #[cfg(target_os = "windows")]
-    if let Some(window) = app_handle.get_webview_window("recording_overlay") {
-        windows_webview::restore_transparency(&window);
-    }
     // Size the overlay for this state (compact vs. streaming), then position it.
     let (width, height) = overlay_dimensions(state);
     if let Some(overlay_window) = app_handle.get_webview_window("recording_overlay") {
-        // Invalidate any delayed hide still in flight from a previous session
-        // (see `hide_recording_overlay`).
-        OVERLAY_SHOW_GENERATION.fetch_add(1, Ordering::SeqCst);
-
         #[cfg(target_os = "linux")]
         let shown_with_layer_shell = if LAYER_SHELL_ACTIVE.load(Ordering::SeqCst) {
             let position = settings::get_settings(app_handle).overlay_position;
@@ -686,35 +685,70 @@ fn update_overlay_position_on_main(app_handle: &AppHandle) {
     }
 }
 
-/// Generation counter bumped every time the overlay is shown. The delayed
-/// `hide()` below only unmaps the window if no show happened after it was
-/// scheduled, so a hide left over from a finished transcription can never
-/// take down the overlay of a session that started in the meantime — e.g. a
-/// press the coordinator remembered while the pipeline was busy and started
-/// the instant it drained, well inside the 300 ms hide delay.
-static OVERLAY_SHOW_GENERATION: AtomicU64 = AtomicU64::new(0);
+/// Visibility requests are ordered before they enter the UI queue. A driver
+/// hang can delay a stop-state show until after hide was requested; incrementing
+/// only when show executes lets that stale show cancel its own cleanup.
+struct OverlayVisibility(AtomicU64);
 
-/// Hides the recording overlay window with fade-out animation
+impl OverlayVisibility {
+    fn request(&self) -> u64 {
+        self.0.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    fn is_current(&self, generation: u64) -> bool {
+        self.0.load(Ordering::SeqCst) == generation
+    }
+}
+
+static OVERLAY_VISIBILITY: OverlayVisibility = OverlayVisibility(AtomicU64::new(0));
+
+/// Fade out and hide even if recording failed or the overlay setting changed.
 pub fn hide_recording_overlay(app_handle: &AppHandle) {
-    // Always hide the overlay regardless of settings - if setting was changed while recording,
-    // we still want to hide it properly
-    if let Some(overlay_window) = app_handle.get_webview_window("recording_overlay") {
-        // Snapshot before doing anything observable, so any show that lands
-        // after this point invalidates the delayed hide below.
-        let scheduled_at = OVERLAY_SHOW_GENERATION.load(Ordering::SeqCst);
-        // Emit event to trigger fade-out animation
-        let _ = overlay_window.emit("hide-overlay", ());
-        // Hide the window after a short delay to allow animation to complete,
-        // unless a newer session has shown the overlay again by then.
-        let window_clone = overlay_window.clone();
+    let generation = OVERLAY_VISIBILITY.request();
+    let handle = app_handle.clone();
+    if let Err(error) = app_handle.run_on_main_thread(move || {
+        if !OVERLAY_VISIBILITY.is_current(generation) {
+            return;
+        }
+        #[cfg(target_os = "windows")]
+        if windows_webview::take_renderer_failure() {
+            // Do not wait on JavaScript after a graphics reset. Native hiding
+            // must still run when the renderer cannot service a fade-out event.
+            log::debug!("Hiding recording overlay without animation after renderer failure");
+            finish_overlay_hide(&handle, generation);
+            return;
+        }
+        if let Some(window) = handle.get_webview_window("recording_overlay") {
+            let _ = window.emit("hide-overlay", ());
+        }
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(300));
-            if OVERLAY_SHOW_GENERATION.load(Ordering::SeqCst) != scheduled_at {
-                log::debug!("Skipping stale overlay hide: a newer session is showing the overlay");
-                return;
+            let hide_handle = handle.clone();
+            // Check on the same UI thread that performs hide. A newer recording
+            // request must invalidate this delayed work before it can hide it.
+            if let Err(error) = handle.run_on_main_thread(move || {
+                finish_overlay_hide(&hide_handle, generation);
+            }) {
+                log::error!("Failed to schedule recording overlay hide: {error}");
             }
-            let _ = window_clone.hide();
         });
+    }) {
+        log::error!("Failed to schedule recording overlay fade-out: {error}");
+    }
+}
+
+/// Runs only on the UI thread, keeping the generation check and native hide
+/// ordered against queued shows. Neither step depends on the renderer's state.
+fn finish_overlay_hide(app_handle: &AppHandle, generation: u64) {
+    if !OVERLAY_VISIBILITY.is_current(generation) {
+        log::debug!("Skipping stale overlay hide: newer visibility request");
+        return;
+    }
+    if let Some(window) = app_handle.get_webview_window("recording_overlay") {
+        match window.hide() {
+            Ok(()) => log::debug!("Recording overlay hidden (generation {generation})"),
+            Err(error) => log::error!("Failed to hide recording overlay: {error}"),
+        }
     }
 }
 
@@ -778,6 +812,24 @@ pub fn emit_levels(app_handle: &AppHandle, levels: &[f32]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hide_invalidates_a_show_queued_before_renderer_recovery() {
+        let visibility = OverlayVisibility(AtomicU64::new(0));
+        let queued_show = visibility.request();
+        let hide = visibility.request();
+        assert!(!visibility.is_current(queued_show));
+        assert!(visibility.is_current(hide));
+    }
+
+    #[test]
+    fn new_recording_invalidates_old_delayed_hide_before_ui_dispatch() {
+        let visibility = OverlayVisibility(AtomicU64::new(0));
+        let old_hide = visibility.request();
+        let new_show = visibility.request();
+        assert!(!visibility.is_current(old_hide));
+        assert!(visibility.is_current(new_show));
+    }
 
     #[test]
     fn monitor_hit_test_uses_half_open_physical_bounds() {

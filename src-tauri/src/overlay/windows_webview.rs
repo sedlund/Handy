@@ -1,26 +1,26 @@
-//! Preserve the recording overlay's transparent WebView2 surface after a
-//! display-driver reset. WebView2 recreates its GPU process automatically;
-//! restoring its background avoids reloading React and losing live UI state.
+//! Log overlay renderer failures separately from transcription worker failures.
+//! Resetting the WebView2 background after a hard driver failure did not restore
+//! its compositor surface; do not mutate the controller from that callback.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::WebviewWindow;
 use webview2_com::{
-    Microsoft::Web::WebView2::Win32::COREWEBVIEW2_PROCESS_FAILED_KIND_GPU_PROCESS_EXITED,
+    Microsoft::Web::WebView2::Win32::{
+        COREWEBVIEW2_PROCESS_FAILED_KIND_GPU_PROCESS_EXITED,
+        COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_EXITED,
+    },
     ProcessFailedEventHandler,
 };
 
-pub(super) fn restore_transparency(window: &WebviewWindow) {
-    // CSS remains transparent, but the native WebView2 background can become
-    // opaque after device loss. Touch only the webview layer, not the window's
-    // native brush. Reassert on show too, since a driver reset need not exit
-    // the browser's GPU process. The transcription GPU setting is unaffected.
-    let webview: &tauri::Webview = window.as_ref();
-    if let Err(error) = webview.set_background_color(Some(tauri::webview::Color(0, 0, 0, 0))) {
-        log::warn!("Failed to restore recording overlay transparency: {error}");
-    }
+static RENDERER_FAILED: AtomicBool = AtomicBool::new(false);
+
+/// A failed renderer cannot be relied on to animate or acknowledge a hide.
+/// Consume once so later healthy recordings retain their normal fade-out.
+pub(super) fn take_renderer_failure() -> bool {
+    RENDERER_FAILED.swap(false, Ordering::AcqRel)
 }
 
 pub(super) fn watch_gpu_process(window: &WebviewWindow) {
-    let recovery_window = window.clone();
     let result = window.with_webview(move |webview| {
         // SAFETY: with_webview runs on the UI thread, and WebView2 invokes this
         // event on that same thread. The handler keeps no raw COM pointers.
@@ -32,10 +32,12 @@ pub(super) fn watch_gpu_process(window: &WebviewWindow) {
                     };
                     let mut kind = Default::default();
                     args.ProcessFailedKind(&mut kind)?;
-                    log::warn!("Recording overlay WebView2 process failure: {:?}", kind);
-                    if kind == COREWEBVIEW2_PROCESS_FAILED_KIND_GPU_PROCESS_EXITED {
-                        restore_transparency(&recovery_window);
+                    if kind == COREWEBVIEW2_PROCESS_FAILED_KIND_GPU_PROCESS_EXITED
+                        || kind == COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_EXITED
+                    {
+                        RENDERER_FAILED.store(true, Ordering::Release);
                     }
+                    log::warn!("Recording overlay WebView2 process failure: {:?}", kind);
                     Ok(())
                 }));
                 // The core owns the event handler until the overlay is destroyed.
