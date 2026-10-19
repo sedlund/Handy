@@ -288,6 +288,7 @@ struct Shared {
     on_device_restored: Option<OnDeviceFallback>,
     device_restore_pending: AtomicBool,
     on_device_upgraded: Option<OnDeviceFallback>,
+    on_device_changed: Option<OnDeviceFallback>,
     device_upgrade_pending: AtomicBool,
     /// The loaded model (logically: it stays loaded while its worker is
     /// replaced after a crash or cancel).
@@ -466,21 +467,25 @@ impl EngineSupervisor {
         on_device_fallback: impl Fn(&LoadedInfo) + Send + Sync + 'static,
         on_device_restored: impl Fn(&LoadedInfo) + Send + Sync + 'static,
     ) -> Self {
-        Self::with_device_upgrade_handler(
+        Self::with_device_status_handlers(
             gpu_allowed,
             on_device_fallback,
             on_device_restored,
+            |_| {},
             |_| {},
         )
     }
 
     /// Device upgrades are reported after successful inference on a newly
     /// selected, higher-ranked GPU; loading it alone is not confirmation.
-    pub fn with_device_upgrade_handler(
+    /// The status handler instead reports each published binding immediately,
+    /// including a GPU retry that fails before its first successful inference.
+    pub fn with_device_status_handlers(
         gpu_allowed: bool,
         on_device_fallback: impl Fn(&LoadedInfo) + Send + Sync + 'static,
         on_device_restored: impl Fn(&LoadedInfo) + Send + Sync + 'static,
         on_device_upgraded: impl Fn(&LoadedInfo) + Send + Sync + 'static,
+        on_device_changed: impl Fn(&LoadedInfo) + Send + Sync + 'static,
     ) -> Self {
         #[cfg(all(unix, not(test)))]
         record_launched_exe();
@@ -490,6 +495,7 @@ impl EngineSupervisor {
             on_device_fallback: Some(Box::new(on_device_fallback)),
             on_device_restored: Some(Box::new(on_device_restored)),
             on_device_upgraded: Some(Box::new(on_device_upgraded)),
+            on_device_changed: Some(Box::new(on_device_changed)),
             ..Shared::default()
         });
         let owner = Owner {
@@ -1345,6 +1351,14 @@ impl Owner {
             return false;
         }
         *loaded = Some(info.clone());
+        // UI status follows the binding, not the later inference-confirmation
+        // notification. Release the snapshot lock before invoking external code.
+        drop(loaded);
+        if let Some(handler) = &self.shared.on_device_changed {
+            if catch_unwind(AssertUnwindSafe(|| handler(info))).is_err() {
+                error!("Transcription device status callback panicked");
+            }
+        }
         true
     }
 

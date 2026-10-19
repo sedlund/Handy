@@ -276,8 +276,9 @@ impl TranscriptionManager {
         let fallback_app = app_handle.clone();
         let restored_app = app_handle.clone();
         let upgraded_app = app_handle.clone();
+        let changed_app = app_handle.clone();
         let manager = Self {
-            engine: EngineSupervisor::with_device_upgrade_handler(
+            engine: EngineSupervisor::with_device_status_handlers(
                 !transcribe_gpu_disabled_for_host(),
                 move |info| {
                     let _ = fallback_app.emit(
@@ -302,6 +303,14 @@ impl TranscriptionManager {
                 move |info| {
                     let _ = upgraded_app.emit(
                         "transcription-device-upgraded",
+                        TranscriptionDeviceEvent {
+                            device_name: info.device.clone(),
+                        },
+                    );
+                },
+                move |info| {
+                    let _ = changed_app.emit(
+                        "transcription-device-changed",
                         TranscriptionDeviceEvent {
                             device_name: info.device.clone(),
                         },
