@@ -1,4 +1,4 @@
-import { listen } from "@tauri-apps/api/event";
+import { emit, listen } from "@tauri-apps/api/event";
 import React, { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import "./RecordingOverlay.css";
@@ -12,6 +12,12 @@ import type {
 import i18n, { syncLanguageFromSettings } from "@/i18n";
 import type { ModelStateEvent } from "@/lib/types/events";
 import { getLanguageDirection } from "@/lib/utils/rtl";
+
+declare global {
+  interface Window {
+    __HANDY_OVERLAY_INSTANCE__?: number;
+  }
+}
 
 type OverlayState = "recording" | "streaming" | "transcribing" | "processing";
 
@@ -166,6 +172,15 @@ const RecordingOverlay: React.FC = () => {
           }
         },
       );
+
+      // Windows replacements stay hidden until every listener is installed.
+      // Other platforms do not inject an instance token.
+      if (window.__HANDY_OVERLAY_INSTANCE__ !== undefined) {
+        await emit(
+          "recording-overlay-ready",
+          window.__HANDY_OVERLAY_INSTANCE__,
+        );
+      }
 
       return () => {
         unlistenShow();

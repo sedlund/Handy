@@ -428,6 +428,10 @@ pub fn create_recording_overlay(app_handle: &AppHandle) {
     if let Some(data_dir) = crate::portable::data_dir() {
         builder = builder.data_directory(data_dir.join("webview"));
     }
+    #[cfg(target_os = "windows")]
+    {
+        builder = builder.initialization_script(windows_webview::prepare_window(app_handle));
+    }
 
     #[allow(unused_variables)]
     match builder.build() {
@@ -512,6 +516,10 @@ fn show_overlay_state(app_handle: &AppHandle, state: &str) {
     let state = state.to_string();
     if let Err(error) = app_handle.run_on_main_thread(move || {
         if OVERLAY_VISIBILITY.is_current(generation) {
+            #[cfg(target_os = "windows")]
+            if windows_webview::defer_show(generation, &state) {
+                return;
+            }
             show_overlay_state_on_main(&handle, &state);
         }
     }) {
@@ -614,6 +622,10 @@ pub fn emit_recording_ready(app_handle: &AppHandle) {
     // and then get reset back to the arming state by the frontend.
     let handle = app_handle.clone();
     let _ = app_handle.run_on_main_thread(move || {
+        #[cfg(target_os = "windows")]
+        if windows_webview::defer_recording_ready() {
+            return;
+        }
         let _ = handle.emit_to("recording_overlay", "recording-ready", ());
     });
 }
@@ -711,11 +723,34 @@ pub fn hide_recording_overlay(app_handle: &AppHandle) {
             return;
         }
         #[cfg(target_os = "windows")]
-        if windows_webview::take_renderer_failure() {
+        if windows_webview::renderer_failed() {
             // Do not wait on JavaScript after a graphics reset. Native hiding
             // must still run when the renderer cannot service a fade-out event.
             log::debug!("Hiding recording overlay without animation after renderer failure");
             finish_overlay_hide(&handle, generation);
+            // Native destruction is asynchronous. Rebuild after Destroyed
+            // has finished unregistering the old label, on a later UI turn.
+            // New recordings queue their show until the replacement is ready.
+            windows_webview::begin_rebuild();
+            if let Some(window) = handle.get_webview_window("recording_overlay") {
+                let app = handle.clone();
+                window.on_window_event(move |event| {
+                    if matches!(event, tauri::WindowEvent::Destroyed) {
+                        let app = app.clone();
+                        std::thread::spawn(move || {
+                            let ui = app.clone();
+                            if let Err(error) = app.run_on_main_thread(move || create_recording_overlay(&ui)) {
+                                log::error!("Failed to schedule overlay recreation; restart Handy to restore its preview: {error}");
+                            }
+                        });
+                    }
+                });
+                if let Err(error) = window.destroy() {
+                    log::error!("Failed to destroy damaged recording overlay; leaving it hidden: {error}");
+                }
+            } else {
+                create_recording_overlay(&handle);
+            }
             return;
         }
         if let Some(window) = handle.get_webview_window("recording_overlay") {
