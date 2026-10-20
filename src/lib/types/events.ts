@@ -5,6 +5,10 @@ export interface ModelStateEvent {
   error?: string;
 }
 
+export interface TranscriptionDeviceEvent {
+  device_name: string;
+}
+
 export interface RecordingErrorEvent {
   error_type: string;
   detail?: string;

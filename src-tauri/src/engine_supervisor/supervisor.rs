@@ -20,7 +20,7 @@ use super::protocol::{
 use super::worker::LOG_LINE_PREFIX;
 use super::{CPU_ONLY_FLAG, LOG_LEVEL_ENV, WORKER_FLAG};
 use log::{debug, error, info, warn, Level};
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::io::{self, BufRead, BufReader, Write};
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -46,6 +46,29 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 /// here right before an abort).
 const STDERR_TAIL_LINES: usize = 64;
 const SAMPLE_RATE: f64 = 16_000.0;
+/// Bound retries even if devices repeatedly appear during recovery.
+const MAX_GPU_RECOVERY_ATTEMPTS: usize = 8;
+/// Discover devices only at dictation boundaries. This supports a dedicated
+/// GPU powered off at startup, or removed and later reconnected. Visibility
+/// alone never retries a failed device: it must first disappear and return,
+/// or the user must explicitly change accelerators or restart Handy.
+const AUTO_DEVICE_RECHECK_INTERVAL: Duration = Duration::from_secs(60);
+
+#[derive(Default)]
+struct GpuRecheck {
+    next: Option<Instant>,
+}
+
+impl GpuRecheck {
+    fn due(&self) -> bool {
+        self.next.is_some_and(|next| Instant::now() >= next)
+    }
+
+    fn schedule(&mut self) {
+        self.next
+            .get_or_insert_with(|| Instant::now() + AUTO_DEVICE_RECHECK_INTERVAL);
+    }
+}
 
 /// How long decoding work may take before its worker counts as hung, by the
 /// device the model runs on. On a GPU a hang is recovered from (retried on
@@ -177,10 +200,12 @@ pub struct Finalized {
 
 type Reply<T> = mpsc::Sender<T>;
 type OnProgress = Box<dyn FnMut(StreamProgress) + Send>;
+type OnDeviceFallback = Box<dyn Fn(&LoadedInfo) + Send + Sync>;
 
 enum Command {
     Load(LoadSpec, Reply<Result<LoadedInfo, EngineError>>),
     Unload(Reply<()>),
+    RecheckGpu(Reply<Result<Option<LoadedInfo>, EngineError>>),
     Transcribe {
         pcm: Vec<f32>,
         run: RunOptions,
@@ -214,10 +239,23 @@ struct Shared {
     /// Whether this host may use a GPU at all. When not, every worker is
     /// CPU-only, device probes included.
     gpu_allowed: bool,
-    /// A worker with GPU backends crashed or hung (in backend init, device
-    /// listing, model load or inference). Models load in CPU-only workers,
-    /// and devices are not listed again, until [`EngineSupervisor::retry_gpu`].
+    /// A GPU-backend failure could not be attributed to one device (e.g.
+    /// backend initialization crashed). Models then load in CPU-only workers
+    /// until an explicit accelerator change or restart; known devices
+    /// fail independently.
     gpu_unavailable: AtomicBool,
+    /// Quarantine individual GPU identities while other GPUs remain usable.
+    failed_gpus: Mutex<HashMap<String, String>>,
+    /// A failed device can return automatically only after a successful
+    /// enumeration observed it missing. Failed probes never count as removal.
+    missing_failed_gpus: Mutex<HashSet<String>>,
+    gpu_recheck: Mutex<GpuRecheck>,
+    fallback_active: AtomicBool,
+    /// Report each recovery once, after a replacement model has loaded.
+    gpu_fallback_pending: AtomicBool,
+    on_device_fallback: Option<OnDeviceFallback>,
+    on_device_restored: Option<OnDeviceFallback>,
+    device_restore_pending: AtomicBool,
     /// The loaded model (logically: it stays loaded while its worker is
     /// replaced after a crash or cancel).
     loaded: Mutex<Option<LoadedInfo>>,
@@ -250,7 +288,7 @@ impl Shared {
                     "Could not start a transcription worker to list compute devices: {}",
                     failure
                 );
-                if failure.worker_lost() && !cpu_only {
+                if failure.requires_restart() && !cpu_only {
                     self.mark_gpu_unavailable(format!(
                         "a worker with GPU backends {failure} while listing compute devices"
                     ));
@@ -288,6 +326,20 @@ impl Shared {
                 );
             }
         }
+        // Keep a present-but-failing driver blacklisted. A real availability
+        // transition (e.g. a gaming laptop powering its dedicated GPU off/on)
+        // is the only automatic way to release an individual device.
+        let mut failed = lock(&self.failed_gpus);
+        let mut missing = lock(&self.missing_failed_gpus);
+        failed.retain(|key, name| {
+            if device_missing(key, Some(&new)) {
+                missing.insert(key.clone());
+            } else if missing.remove(key) {
+                info!("Transcription GPU '{}' became available again", name);
+                return false;
+            }
+            true
+        });
         *current = Some(new);
     }
 
@@ -298,8 +350,52 @@ impl Shared {
     /// `reason` is logged when this changes the state.
     fn mark_gpu_unavailable(&self, reason: impl fmt::Display) {
         if !self.gpu_unavailable.swap(true, Ordering::AcqRel) {
+            self.gpu_fallback_pending.store(true, Ordering::Release);
             warn!("Transcription GPU marked unavailable: {}", reason);
         }
+    }
+
+    fn has_gpu_failures(&self) -> bool {
+        self.gpu_unavailable() || !lock(&self.failed_gpus).is_empty()
+    }
+
+    fn mark_gpu_failed(&self, key: &str, name: &str, reason: impl fmt::Display) -> bool {
+        let fresh = lock(&self.failed_gpus)
+            .insert(key.to_string(), name.to_string())
+            .is_none();
+        if fresh {
+            // Allocation-error recovery may already have confirmed removal
+            // before this failure was attributed to its bound device.
+            if device_missing(key, lock(&self.devices).as_deref()) {
+                lock(&self.missing_failed_gpus).insert(key.to_string());
+            }
+            self.gpu_fallback_pending.store(true, Ordering::Release);
+            warn!(
+                "Transcription GPU '{}' marked unavailable: {}",
+                name, reason
+            );
+        }
+        fresh
+    }
+
+    fn recovery_spec(&self, spec: &LoadSpec) -> LoadSpec {
+        // Match set_devices' lock order: registry before failure state.
+        let devices = lock(&self.devices);
+        let failed = lock(&self.failed_gpus);
+        select_recovery_spec(
+            spec,
+            self.gpu_unavailable(),
+            &failed,
+            devices.as_deref().unwrap_or_default(),
+        )
+    }
+
+    /// A successful GPU or CPU replacement consumes one pending notification.
+    fn take_device_fallback(&self, spec: &LoadSpec) -> bool {
+        !spec.cpu_only()
+            && !spec.pinned()
+            && self.has_gpu_failures()
+            && self.gpu_fallback_pending.swap(false, Ordering::AcqRel)
     }
 
     fn epoch(&self) -> u64 {
@@ -335,12 +431,34 @@ impl EngineSupervisor {
     /// Start the owner thread. No worker runs until something needs one.
     /// Without `gpu_allowed`, every worker is CPU-only, so no GPU driver is
     /// ever loaded.
+    #[cfg(test)]
     pub fn new(gpu_allowed: bool) -> Self {
+        Self::with_device_fallback_handler(gpu_allowed, |_| {})
+    }
+
+    /// Start the owner thread with a notification after successful device fallback.
+    /// The handler runs on the owner thread; it must not block or call back
+    /// into the supervisor.
+    pub fn with_device_fallback_handler(
+        gpu_allowed: bool,
+        on_device_fallback: impl Fn(&LoadedInfo) + Send + Sync + 'static,
+    ) -> Self {
+        Self::with_device_handlers(gpu_allowed, on_device_fallback, |_| {})
+    }
+
+    /// Device restoration is reported only after successful inference.
+    pub fn with_device_handlers(
+        gpu_allowed: bool,
+        on_device_fallback: impl Fn(&LoadedInfo) + Send + Sync + 'static,
+        on_device_restored: impl Fn(&LoadedInfo) + Send + Sync + 'static,
+    ) -> Self {
         #[cfg(all(unix, not(test)))]
         record_launched_exe();
         let (commands, queue) = mpsc::channel();
         let shared = Arc::new(Shared {
             gpu_allowed,
+            on_device_fallback: Some(Box::new(on_device_fallback)),
+            on_device_restored: Some(Box::new(on_device_restored)),
             ..Shared::default()
         });
         let owner = Owner {
@@ -392,7 +510,17 @@ impl EngineSupervisor {
     /// the GPU failure, if any, so the next load may use (and list) the GPU
     /// again. A new failure sets the flag again.
     pub fn retry_gpu(&self, reason: &str) {
-        if self.shared.gpu_unavailable.swap(false, Ordering::AcqRel) {
+        self.shared
+            .gpu_fallback_pending
+            .store(false, Ordering::Release);
+        self.shared
+            .device_restore_pending
+            .store(false, Ordering::Release);
+        let had_device_failures = !lock(&self.shared.failed_gpus).is_empty();
+        lock(&self.shared.failed_gpus).clear();
+        lock(&self.shared.missing_failed_gpus).clear();
+        *lock(&self.shared.gpu_recheck) = GpuRecheck::default();
+        if self.shared.gpu_unavailable.swap(false, Ordering::AcqRel) || had_device_failures {
             info!("Transcription GPU no longer marked unavailable: {}", reason);
         }
     }
@@ -402,8 +530,32 @@ impl EngineSupervisor {
         lock(&self.shared.loaded).clone()
     }
 
+    pub fn is_in_fallback(&self) -> bool {
+        self.shared.fallback_active.load(Ordering::Acquire)
+    }
+
+    /// Cheap time check: never enumerates hardware on the caller's thread.
+    pub fn gpu_recheck_due(&self) -> bool {
+        lock(&self.shared.gpu_recheck).due()
+    }
+
+    /// Run between dictations on the engine owner, preserving the preference.
+    pub fn recheck_gpu(&self) -> Result<Option<LoadedInfo>, EngineError> {
+        self.ask(Command::RecheckGpu)
+            .unwrap_or_else(|| Err(engine_stopped()))
+    }
+
+    pub fn failed_gpu_devices(&self) -> Vec<(String, String)> {
+        let mut devices: Vec<_> = lock(&self.shared.failed_gpus)
+            .iter()
+            .map(|(key, name)| (key.clone(), name.clone()))
+            .collect();
+        devices.sort_by(|a, b| a.0.cmp(&b.0));
+        devices
+    }
+
     /// Transcribe 16 kHz mono PCM with the loaded model. A worker crash or
-    /// hang is retried once in a fresh worker (on CPU if it was on the GPU).
+    /// hang replays the audio on another healthy GPU or CPU, with bounded retries.
     pub fn transcribe(&self, pcm: Vec<f32>, run: RunOptions) -> Result<Transcript, EngineError> {
         self.transcribe_since(self.cancel_mark(), pcm, run)
     }
@@ -569,8 +721,12 @@ fn not_loaded() -> EngineError {
 enum Failure {
     /// The worker process could not be started.
     Spawn(io::Error),
-    /// transcribe.cpp returned an error; the worker is fine.
+    /// A request, model, or allocation error; the worker is still usable.
     Remote(String),
+    /// The native context failed even though the worker could still reply.
+    Backend(String),
+    /// Not a device failure unless a fresh probe confirms device removal.
+    Allocation(String),
     /// The worker exited or crashed. Carries exit status and its last
     /// native output.
     Crashed(String),
@@ -580,9 +736,12 @@ enum Failure {
 }
 
 impl Failure {
-    /// Whether the worker is gone.
-    fn worker_lost(&self) -> bool {
-        matches!(self, Failure::Crashed(_) | Failure::Hung(_))
+    /// A crashed, hung, or failed native context must be discarded.
+    fn requires_restart(&self) -> bool {
+        matches!(
+            self,
+            Failure::Crashed(_) | Failure::Hung(_) | Failure::Backend(_)
+        )
     }
 }
 
@@ -590,7 +749,9 @@ impl fmt::Display for Failure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Failure::Spawn(e) => write!(f, "failed to start transcription worker: {e}"),
-            Failure::Remote(message) => f.write_str(message),
+            Failure::Remote(message) | Failure::Backend(message) | Failure::Allocation(message) => {
+                f.write_str(message)
+            }
             Failure::Crashed(detail) => write!(f, "transcription worker crashed ({detail})"),
             Failure::Hung(t) => write!(f, "transcription worker did not respond within {t:?}"),
             Failure::Cancelled => f.write_str("cancelled"),
@@ -646,6 +807,9 @@ impl Owner {
                 Command::Load(spec, reply) => {
                     let _ = reply.send(self.load(spec));
                 }
+                Command::RecheckGpu(reply) => {
+                    let _ = reply.send(self.recheck_gpu());
+                }
                 Command::Unload(reply) => {
                     self.unload();
                     self.unloads_done += 1;
@@ -690,7 +854,12 @@ impl Owner {
     fn load(&mut self, spec: LoadSpec) -> Result<LoadedInfo, EngineError> {
         self.unload();
         self.spec = Some(spec);
-        let result = self.start();
+        // Idle unloading must not prevent a due retry on the next dictation.
+        let result = match self.recheck_gpu() {
+            Ok(Some(info)) => Ok(info),
+            Ok(None) => self.start(),
+            Err(error) => Err(error),
+        };
         if result.is_err() {
             self.spec = None;
         }
@@ -714,71 +883,377 @@ impl Owner {
         *lock(&self.shared.loaded) = None;
     }
 
-    /// The spec a fresh worker should load: CPU while the GPU is marked
-    /// unavailable, unless the device was chosen explicitly.
+    /// Keep the preference intact while choosing a healthy recovery device.
     fn effective_spec(&self, spec: &LoadSpec) -> LoadSpec {
-        if spec.pinned() || spec.cpu_only() || !self.shared.gpu_unavailable() {
-            return spec.clone();
-        }
-        info!("Loading the transcription model on CPU: the GPU failed earlier");
-        spec.cpu()
+        self.shared.recovery_spec(spec)
     }
 
-    /// Whether a worker for `spec` registers only the CPU backends.
     fn cpu_only_worker(&self, spec: &LoadSpec) -> bool {
         spec.cpu_only() || !self.shared.gpu_allowed
     }
 
-    /// Start a worker for `spec` and load it there. A worker that may use the
-    /// GPU lists the devices in its hello, which keeps the list current (a
-    /// GPU that comes back is just noticed). A CPU-only worker would only
-    /// see the CPU, so it doesn't list.
-    fn start_worker(&self, spec: &LoadSpec) -> Result<(Worker, LoadedInfo), Failure> {
+    fn start_worker(&self, spec: &LoadSpec) -> Result<(Worker, LoadedInfo), StartFailure> {
+        self.start_worker_with_selection(spec, true)
+    }
+
+    fn start_worker_with_selection(
+        &self,
+        spec: &LoadSpec,
+        reselect: bool,
+    ) -> Result<(Worker, LoadedInfo), StartFailure> {
         let cpu_only = self.cpu_only_worker(spec);
-        let mut worker = self.shared.hello(cpu_only, !cpu_only)?;
-        let info = worker.load(spec)?;
+        let mut worker =
+            self.shared
+                .hello(cpu_only, !cpu_only)
+                .map_err(|failure| StartFailure {
+                    failure,
+                    gpu_worker: !cpu_only,
+                    device: None,
+                })?;
+        // Re-select after hello: this registry belongs to the new process and
+        // notices removed devices and new registry indices.
+        let wanted = if cpu_only || spec.pinned() || !reselect {
+            spec.clone()
+        } else {
+            self.effective_spec(spec)
+        };
+        if wanted.cpu_only() && !cpu_only {
+            drop(worker);
+            return self.start_worker_with_selection(&wanted, reselect);
+        }
+        let device = match &wanted.device {
+            DeviceSelector::Key(key) | DeviceSelector::RecoveryKey(key) => {
+                lock(&self.shared.devices).as_ref().and_then(|devices| {
+                    devices
+                        .iter()
+                        .find(|device| device.is_gpu() && &device.key == key)
+                        .map(|device| (device.key.clone(), device.label().to_string()))
+                })
+            }
+            _ => None,
+        };
+        let info = worker.load(&wanted).map_err(|failure| StartFailure {
+            failure,
+            gpu_worker: !cpu_only,
+            device,
+        })?;
         Ok((worker, info))
     }
 
-    /// Start a worker and load the current spec in it. If a worker with GPU
-    /// backends is lost on the way (backend init, device listing or the
-    /// load), mark the GPU unavailable and retry once in a CPU-only worker.
+    /// Each failed known GPU is excluded. A fresh worker tries another GPU,
+    /// then a strictly CPU-only worker when no healthy GPU remains. A fault
+    /// during backend initialization cannot be attributed to one GPU, so it
+    /// retains the upstream CPU-only fallback.
     fn start(&mut self) -> Result<LoadedInfo, EngineError> {
+        self.start_with_notification(true)
+    }
+
+    fn start_with_notification(&mut self, notify: bool) -> Result<LoadedInfo, EngineError> {
+        self.start_on(notify, None)
+    }
+
+    fn start_on(
+        &mut self,
+        notify: bool,
+        first_gpu: Option<&str>,
+    ) -> Result<LoadedInfo, EngineError> {
         let spec = self.spec.clone().ok_or_else(not_loaded)?;
         let started = Instant::now();
-        let wanted = self.effective_spec(&spec);
-        let (worker, info) = match self.start_worker(&wanted) {
-            Ok(started) => started,
-            Err(failure)
-                if failure.worker_lost() && !self.cpu_only_worker(&wanted) && !wanted.pinned() =>
-            {
-                self.shared.mark_gpu_unavailable(format!(
-                    "a worker for '{}' with GPU backends {}",
-                    wanted.path.display(),
-                    failure
-                ));
-                warn!("Retrying in a CPU-only worker");
-                self.start_worker(&wanted.cpu())?
+        let mut gpu_attempts = 0;
+        let (worker, info) = loop {
+            let wanted = match first_gpu.filter(|_| gpu_attempts == 0) {
+                Some(key) => LoadSpec {
+                    path: spec.path.clone(),
+                    backend: Backend::Auto,
+                    device: DeviceSelector::RecoveryKey(key.to_string()),
+                },
+                None => self.effective_spec(&spec),
+            };
+            match self.start_worker(&wanted) {
+                Ok(started) => break started,
+                Err(StartFailure {
+                    failure,
+                    gpu_worker,
+                    device,
+                }) if failure.requires_restart() && gpu_worker && !spec.pinned() => {
+                    let isolated = device.as_ref().is_some_and(|device| {
+                        gpu_attempts < MAX_GPU_RECOVERY_ATTEMPTS
+                            && self.shared.mark_gpu_failed(&device.0, &device.1, &failure)
+                    });
+                    if !isolated {
+                        self.shared.mark_gpu_unavailable(&failure);
+                    }
+                    gpu_attempts += 1;
+                    warn!(
+                        "Retrying model load on the next healthy device: {}",
+                        failure
+                    );
+                }
+                Err(error) => {
+                    // An upgrade may have advanced beyond its original candidate.
+                    // Preserve the identity of the GPU that actually failed,
+                    // including ordinary errors such as exhausted VRAM.
+                    if first_gpu.is_some() && error.gpu_worker {
+                        if let Some((key, name)) = &error.device {
+                            self.shared.mark_gpu_failed(key, name, &error.failure);
+                        }
+                    }
+                    return Err(error.failure.into());
+                }
             }
-            Err(failure) => return Err(failure.into()),
         };
         debug!(
             "Worker (pid {}) spawned and loaded the model in {}ms",
             worker.control.pid,
             started.elapsed().as_millis()
         );
-        self.publish_loaded(&info);
         self.worker = Some(worker);
+        self.update_gpu_recheck(&spec, &info);
+        if self.publish_loaded(&info) && self.shared.take_device_fallback(&spec) && notify {
+            info!(
+                "Transcription recovered on {} '{}' ({})",
+                if info.on_gpu { "GPU" } else { "CPU" },
+                info.device,
+                info.backend
+            );
+            if let Some(handler) = &self.shared.on_device_fallback {
+                if catch_unwind(AssertUnwindSafe(|| handler(&info))).is_err() {
+                    error!("Transcription device fallback callback panicked");
+                }
+            }
+        }
         Ok(info)
+    }
+
+    /// Compare the bound device with the original request, preserving the
+    /// saved preference while a temporary replacement is used.
+    fn update_gpu_recheck(&self, spec: &LoadSpec, info: &LoadedInfo) {
+        let fallback = self.shared.gpu_allowed
+            && !spec.cpu_only()
+            && !spec.pinned()
+            && match &spec.device {
+                DeviceSelector::Key(key) | DeviceSelector::RecoveryKey(key) => {
+                    !info.on_gpu || info.device_key.as_ref() != Some(key)
+                }
+                // Auto accepts any healthy GPU. A different device's blacklist
+                // must not keep this binding in fallback or suppress upgrades.
+                _ => !info.on_gpu,
+            };
+        let was_fallback = self.shared.fallback_active.swap(fallback, Ordering::AcqRel);
+        let mut recheck = lock(&self.shared.gpu_recheck);
+        if self.shared.gpu_allowed
+            && !spec.cpu_only()
+            && !spec.pinned()
+            && !self.shared.gpu_unavailable()
+            && (fallback || matches!(spec.device, DeviceSelector::Auto))
+        {
+            recheck.schedule();
+        } else {
+            recheck.next = None;
+        }
+        if fallback {
+            self.shared
+                .device_restore_pending
+                .store(false, Ordering::Release);
+        } else {
+            if was_fallback && info.on_gpu && !spec.cpu_only() && !spec.pinned() {
+                self.shared
+                    .device_restore_pending
+                    .store(true, Ordering::Release);
+            }
+        }
+    }
+
+    /// Called after successful, nonempty batch inference or stream finalize.
+    /// Confirm recovery after successful inference; loading alone does not
+    /// establish that the selected device can transcribe.
+    fn confirm_device_success(&self) {
+        if self.shared.fallback_active.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(info) = self
+            .worker
+            .as_ref()
+            .and_then(|worker| worker.info.as_ref())
+            .filter(|info| info.on_gpu)
+        else {
+            return;
+        };
+
+        if self
+            .shared
+            .device_restore_pending
+            .swap(false, Ordering::AcqRel)
+        {
+            info!("Transcription confirmed on preferred GPU '{}'", info.device);
+            if let Some(handler) = &self.shared.on_device_restored {
+                if catch_unwind(AssertUnwindSafe(|| handler(info))).is_err() {
+                    error!("Transcription device restoration callback panicked");
+                }
+            }
+        }
+    }
+
+    /// An optional upgrade must never take away a working fallback. Restore
+    /// its exact identity first, then attempt a strictly CPU-only worker.
+    /// This also covers allocation failures on an alternate GPU: retrying the
+    /// normal candidate ranking could select that failing GPU again and lose
+    /// the previously working CPU path.
+    fn restore_fallback(
+        &mut self,
+        previous: Option<&LoadedInfo>,
+    ) -> Result<LoadedInfo, EngineError> {
+        let spec = self.spec.clone().ok_or_else(not_loaded)?;
+        let previous_spec = previous
+            .filter(|info| info.on_gpu)
+            .and_then(|info| info.device_key.as_ref())
+            .map(|key| LoadSpec {
+                path: spec.path.clone(),
+                backend: Backend::Auto,
+                device: DeviceSelector::RecoveryKey(key.clone()),
+            })
+            .unwrap_or_else(|| spec.cpu());
+        let restored = self
+            .start_worker_with_selection(&previous_spec, false)
+            .or_else(|error| {
+                if previous_spec.cpu_only() {
+                    return Err(error);
+                }
+                if let Some((key, name)) = &error.device {
+                    self.shared.mark_gpu_failed(key, name, &error.failure);
+                } else if error.failure.requires_restart() {
+                    self.shared.mark_gpu_unavailable(&error.failure);
+                }
+                warn!(
+                    "Previous GPU could not be restored; trying strict CPU: {}",
+                    error.failure
+                );
+                self.start_worker_with_selection(&spec.cpu(), false)
+            });
+        match restored {
+            Ok((worker, info)) => {
+                self.worker = Some(worker);
+                self.update_gpu_recheck(&spec, &info);
+                self.publish_loaded(&info);
+                self.shared
+                    .gpu_fallback_pending
+                    .store(false, Ordering::Release);
+                Ok(info)
+            }
+            Err(error) => {
+                self.spec = None;
+                *lock(&self.shared.loaded) = None;
+                Err(error.failure.into())
+            }
+        }
+    }
+
+    /// Probe in an isolated, model-less worker when recovery is due. A
+    /// successful enumeration alone never clears a device's failure state:
+    /// it must also load the model. Fresh enumeration resolves stable device
+    /// identities again because driver restarts can change registry indices.
+    /// Backend initialization can be slow or hang, so the model-less probe is
+    /// isolated with the usual timeout and cancellation protections. The existing
+    /// model stays alive while probing; only a changed candidate replaces it,
+    /// and at most one model is held during the actual switch.
+    fn recheck_gpu(&mut self) -> Result<Option<LoadedInfo>, EngineError> {
+        if self.stream.is_some() || !lock(&self.shared.gpu_recheck).due() {
+            return Ok(None);
+        }
+        let Some(spec) = self.spec.clone() else {
+            return Ok(None);
+        };
+        if !self.shared.gpu_allowed
+            || self.shared.gpu_unavailable()
+            || spec.cpu_only()
+            || spec.pinned()
+        {
+            *lock(&self.shared.gpu_recheck) = GpuRecheck::default();
+            return Ok(None);
+        }
+        // Reserve discovery before touching the driver, even if probing fails.
+        lock(&self.shared.gpu_recheck).next = Some(Instant::now() + AUTO_DEVICE_RECHECK_INTERVAL);
+        let epoch = self.shared.epoch();
+        let probe = (|| {
+            let _probing = lock(&self.shared.probing);
+            let mut worker = Worker::spawn(false).map_err(Failure::Spawn)?;
+            worker.call_cancellable(
+                &self.shared,
+                &Request::Hello { list_devices: true },
+                None,
+                HELLO_TIMEOUT,
+                epoch,
+            )
+        })();
+        let devices = match probe {
+            Ok(Response::Hello {
+                devices: Some(devices),
+            }) => devices,
+            Err(Failure::Cancelled) => return Err(EngineError::Cancelled),
+            other => {
+                warn!(
+                    "Automatic GPU recheck failed; keeping current device: {:?}",
+                    other
+                );
+                return Ok(None);
+            }
+        };
+        self.shared.set_devices(devices.clone());
+        let current = self.worker.as_ref().and_then(|worker| worker.info.as_ref());
+        let eligible: Vec<_> = {
+            let failed = lock(&self.shared.failed_gpus);
+            devices
+                .iter()
+                .filter(|device| !failed.contains_key(&device.key))
+                .cloned()
+                .collect()
+        };
+        let Some(candidate) = upgrade_candidate(&spec, current, &eligible) else {
+            return Ok(None);
+        };
+        let previous = current.cloned();
+        let key = candidate.key.clone();
+        let name = candidate.label().to_string();
+        info!(
+            "Automatically selecting available transcription GPU '{}'",
+            name
+        );
+        // Avoid duplicate failure notifications during an optional upgrade.
+        self.shared
+            .gpu_fallback_pending
+            .store(false, Ordering::Release);
+        self.worker = None;
+        let result = self.start_on(false, Some(&key));
+        match result {
+            Ok(info) => {
+                info!(
+                    "Automatic GPU recheck bound '{}' ({})",
+                    info.device, info.backend
+                );
+                Ok(Some(info))
+            }
+            Err(error) => {
+                warn!(
+                    "GPU upgrade failed; restoring the previous device: {}",
+                    error
+                );
+                self.shared
+                    .gpu_fallback_pending
+                    .store(false, Ordering::Release);
+                self.restore_fallback(previous.as_ref()).map(Some)
+            }
+        }
     }
 
     /// Report the model loaded, unless an unload was requested since and is
     /// still waiting in the queue.
-    fn publish_loaded(&self, info: &LoadedInfo) {
+    fn publish_loaded(&self, info: &LoadedInfo) -> bool {
         let mut loaded = lock(&self.shared.loaded);
-        if self.shared.unloads_requested.load(Ordering::SeqCst) == self.unloads_done {
-            *loaded = Some(info.clone());
+        if self.shared.unloads_requested.load(Ordering::SeqCst) != self.unloads_done {
+            return false;
         }
+        *loaded = Some(info.clone());
+        true
     }
 
     /// Make sure the slot holds a worker with the model loaded, starting a
@@ -801,20 +1276,22 @@ impl Owner {
         Ok(())
     }
 
-    /// Drop a worker that crashed or hung (its handle already logged the
-    /// details and native output). If it was on a GPU, mark the GPU
-    /// unavailable so the next worker uses CPU. Returns whether it was.
+    /// Quarantine the bound GPU without disabling other healthy GPUs.
     fn worker_lost(&mut self, during: &str, failure: &Failure) -> bool {
-        // Dropping the handle reaps the process.
         let info = self.worker.take().and_then(|worker| worker.info.clone());
         let pinned = self.spec.as_ref().is_some_and(LoadSpec::pinned);
         match info {
             Some(info) if info.on_gpu => {
                 if !pinned {
-                    self.shared.mark_gpu_unavailable(format!(
-                        "{failure} during {during} on GPU '{}' ({})",
+                    let reason = format!(
+                        "{failure} during {during} on '{}' ({})",
                         info.device, info.backend
-                    ));
+                    );
+                    if let Some(key) = &info.device_key {
+                        self.shared.mark_gpu_failed(key, &info.device, &reason);
+                    } else {
+                        self.shared.mark_gpu_unavailable(&reason);
+                    }
                 }
                 true
             }
@@ -842,42 +1319,69 @@ impl Owner {
         epoch: u64,
     ) -> Result<Response, Failure> {
         let worker = self.worker.as_mut().expect("caller ensured a worker");
-        let frame = encode_request(request, pcm)?;
-        let sent = {
-            // Check, send and publish under the lock cancel() takes after
-            // bumping the epoch: either this sees the cancel and sends
-            // nothing, or the cancel sees the call and kills its worker.
-            let mut in_flight = lock(&self.shared.in_flight);
-            if self.shared.cancelled_since(epoch) {
-                return Err(Failure::Cancelled);
-            }
-            let sent = worker.control.send(frame);
-            *in_flight = Some(InFlight {
-                what: request_name(request),
-                control: Arc::clone(&worker.control),
-            });
-            sent
-        };
-        let result = if sent {
-            worker.wait(request, deadline)
-        } else {
-            Err(worker.died())
-        };
-        // Gone if cancel() took the call, which means it killed the worker
-        // (possibly just after it answered).
-        let killed = lock(&self.shared.in_flight).take().is_none();
-        if killed || self.shared.cancelled_since(epoch) {
-            if killed || result.as_ref().is_err_and(Failure::worker_lost) {
-                // The next use starts a fresh worker.
-                self.worker = None;
-            }
-            return Err(Failure::Cancelled);
+        let result = worker.call_cancellable(&self.shared, request, pcm, deadline, epoch);
+        if matches!(result, Err(Failure::Cancelled)) {
+            // A cancel may have killed the worker just after its reply.
+            self.worker = None;
+            return result;
         }
-        result
+        match result {
+            Err(Failure::Allocation(message)) if self.bound_gpu_removed(epoch)? => {
+                Err(Failure::Backend(message))
+            }
+            other => other,
+        }
     }
 
-    /// Retry once after a crash or hang, on CPU if it happened on the GPU.
-    /// Not after a hang on CPU, and never for an explicitly chosen device.
+    /// A dead GPU can report OOM instead of a backend failure. Never blame
+    /// ordinary memory pressure: only a successful fresh enumeration that
+    /// no longer contains the bound device confirms removal. The probe is
+    /// isolated and cancellable just like inference; it never loads a model.
+    fn bound_gpu_removed(&self, epoch: u64) -> Result<bool, Failure> {
+        if self.spec.as_ref().is_some_and(LoadSpec::pinned) {
+            return Ok(false);
+        }
+        let Some(info) = self.worker.as_ref().and_then(|worker| worker.info.as_ref()) else {
+            return Ok(false);
+        };
+        let Some(key) = info.device_key.as_deref().filter(|_| info.on_gpu) else {
+            return Ok(false);
+        };
+        let probe = (|| {
+            let mut worker = Worker::spawn(false).map_err(Failure::Spawn)?;
+            worker.call_cancellable(
+                &self.shared,
+                &Request::Hello { list_devices: true },
+                None,
+                HELLO_TIMEOUT,
+                epoch,
+            )
+        })();
+        if self.shared.cancelled_since(epoch) {
+            return Err(Failure::Cancelled);
+        }
+        match probe {
+            Ok(Response::Hello {
+                devices: Some(devices),
+            }) => {
+                let missing = device_missing(key, Some(&devices));
+                self.shared.set_devices(devices);
+                Ok(missing)
+            }
+            Err(Failure::Cancelled) => Err(Failure::Cancelled),
+            other => {
+                warn!(
+                    "Could not confirm GPU removal after allocation failure: {:?}",
+                    other
+                );
+                Ok(false)
+            }
+        }
+    }
+
+    /// Replay captured audio on the remaining GPUs, then CPU. Bound GPU
+    /// attempts even if new devices keep appearing, and retry a CPU crash
+    /// only once. Never retry a CPU hang or an explicitly pinned device.
     fn transcribe(
         &mut self,
         pcm: &[f32],
@@ -889,7 +1393,8 @@ impl Owner {
         let request = Request::Run {
             options: run.clone(),
         };
-        let mut retried = false;
+        let mut gpu_failures = 0;
+        let mut retried_cpu = false;
         loop {
             if self.shared.cancelled_since(epoch) {
                 return Err(EngineError::Cancelled);
@@ -899,17 +1404,36 @@ impl Owner {
             self.ensure_worker()?;
             let deadline = self.deadlines().run(pcm.len());
             match self.call_work(&request, Some(pcm), deadline, epoch) {
-                Ok(Response::Transcript(transcript)) => return Ok(transcript),
+                Ok(Response::Transcript(transcript)) => {
+                    if !transcript.text.trim().is_empty() {
+                        self.confirm_device_success();
+                    }
+                    return Ok(transcript);
+                }
                 Ok(other) => return Err(unexpected(&other).into()),
-                Err(failure) if failure.worker_lost() => {
+                Err(failure) if failure.requires_restart() => {
                     let on_gpu = self.worker_lost("transcription", &failure);
                     let pinned = self.spec.as_ref().is_some_and(LoadSpec::pinned);
                     let hung_on_cpu = matches!(failure, Failure::Hung(_)) && !on_gpu;
-                    if retried || pinned || hung_on_cpu {
+                    if pinned || hung_on_cpu {
                         return Err(failure.into());
                     }
+                    if on_gpu {
+                        gpu_failures += 1;
+                        if gpu_failures > MAX_GPU_RECOVERY_ATTEMPTS {
+                            return Err(failure.into());
+                        }
+                        if gpu_failures == MAX_GPU_RECOVERY_ATTEMPTS {
+                            self.shared
+                                .mark_gpu_unavailable("GPU transcription retry limit reached");
+                        }
+                    } else {
+                        if retried_cpu {
+                            return Err(failure.into());
+                        }
+                        retried_cpu = true;
+                    }
                     warn!("Retrying the transcription in a fresh worker");
-                    retried = true;
                 }
                 Err(failure) => return Err(failure.into()),
             }
@@ -939,7 +1463,7 @@ impl Owner {
             }
             Ok(other) => Err(unexpected(&other).into()),
             Err(failure) => {
-                if failure.worker_lost() {
+                if failure.requires_restart() {
                     self.worker_lost("stream start", &failure);
                 }
                 Err(failure.into())
@@ -983,7 +1507,9 @@ impl Owner {
                 }
             }
             Ok(other) => warn!("Stream feed failed: {}", unexpected(&other)),
-            Err(Failure::Remote(message)) => warn!("Stream feed failed: {}", message),
+            Err(Failure::Remote(message) | Failure::Allocation(message)) => {
+                warn!("Stream feed failed: {}", message)
+            }
             // Later feeds are skipped, and finalize reports the cancel.
             Err(Failure::Cancelled) => {}
             Err(failure) => {
@@ -1021,12 +1547,17 @@ impl Owner {
                 update,
                 text,
                 language,
-            }) => Ok(Some(Finalized {
-                update,
-                text,
-                language,
-                elapsed: started.elapsed(),
-            })),
+            }) => {
+                if !text.full.trim().is_empty() {
+                    self.confirm_device_success();
+                }
+                Ok(Some(Finalized {
+                    update,
+                    text,
+                    language,
+                    elapsed: started.elapsed(),
+                }))
+            }
             Ok(other) => {
                 error!("Stream finalize failed: {}", unexpected(&other));
                 Ok(None)
@@ -1036,7 +1567,7 @@ impl Owner {
                 self.reset_worker_stream();
                 Err(EngineError::Cancelled)
             }
-            Err(Failure::Remote(message)) => {
+            Err(Failure::Remote(message) | Failure::Allocation(message)) => {
                 error!("Stream finalize failed: {}", message);
                 Ok(None)
             }
@@ -1066,6 +1597,105 @@ impl Owner {
             }
         }
     }
+}
+
+#[derive(Debug)]
+struct StartFailure {
+    failure: Failure,
+    gpu_worker: bool,
+    device: Option<(String, String)>,
+}
+
+/// Keep the requested preference intact while selecting a temporary worker.
+/// Exclude each failed GPU independently, so a failed integrated GPU can fall
+/// back to a healthy dedicated GPU (or vice versa) before strict CPU is needed.
+fn select_recovery_spec(
+    spec: &LoadSpec,
+    gpu_unavailable: bool,
+    failed: &HashMap<String, String>,
+    devices: &[DeviceInfo],
+) -> LoadSpec {
+    if spec.pinned() || spec.cpu_only() {
+        return spec.clone();
+    }
+    if gpu_unavailable {
+        return spec.cpu();
+    }
+    if failed.is_empty() {
+        return spec.clone();
+    }
+    let preferred = match &spec.device {
+        DeviceSelector::Key(key) | DeviceSelector::RecoveryKey(key) => Some(key),
+        _ => None,
+    };
+    let healthy = || {
+        devices
+            .iter()
+            .filter(|device| device.is_gpu() && !failed.contains_key(&device.key))
+    };
+    let selected = healthy()
+        .find(|device| preferred == Some(&device.key))
+        .or_else(|| {
+            healthy().max_by(|a, b| {
+                a.memory_total
+                    .cmp(&b.memory_total)
+                    .then_with(|| a.key.cmp(&b.key))
+            })
+        });
+    match selected {
+        Some(device) => LoadSpec {
+            path: spec.path.clone(),
+            backend: Backend::Auto,
+            device: DeviceSelector::RecoveryKey(device.key.clone()),
+        },
+        None => spec.cpu(),
+    }
+}
+
+/// Prefer the saved GPU, otherwise the strongest available GPU. Never
+/// reload an already active device just because another scan was due.
+fn upgrade_candidate<'a>(
+    spec: &LoadSpec,
+    current: Option<&LoadedInfo>,
+    devices: &'a [DeviceInfo],
+) -> Option<&'a DeviceInfo> {
+    let preferred = match &spec.device {
+        DeviceSelector::Key(key) | DeviceSelector::RecoveryKey(key) => Some(key),
+        _ => None,
+    };
+    let best = devices
+        .iter()
+        .filter(|device| device.is_gpu())
+        .max_by(|a, b| {
+            a.memory_total
+                .cmp(&b.memory_total)
+                .then_with(|| a.key.cmp(&b.key))
+        });
+    let candidate = devices
+        .iter()
+        .find(|device| device.is_gpu() && preferred == Some(&device.key))
+        .or(best)?;
+    if let Some(current) = current.filter(|info| info.on_gpu) {
+        if current.device_key.as_ref() == Some(&candidate.key) {
+            return None;
+        }
+        // Do not downgrade a working fallback GPU based on reindexing or a
+        // driver temporarily reporting a smaller set of devices.
+        if preferred != Some(&candidate.key) {
+            let active = devices
+                .iter()
+                .find(|device| Some(&device.key) == current.device_key.as_ref());
+            if active.is_some_and(|active| active.memory_total >= candidate.memory_total) {
+                return None;
+            }
+        }
+    }
+    Some(candidate)
+}
+
+/// A failed or skipped enumeration cannot prove a device was removed.
+fn device_missing(key: &str, devices: Option<&[DeviceInfo]>) -> bool {
+    devices.is_some_and(|devices| !devices.iter().any(|device| device.key == key))
 }
 
 fn pending_ms(update: &StreamUpdate) -> i64 {
@@ -1117,6 +1747,46 @@ struct Worker {
 }
 
 impl Worker {
+    /// Send and publish the call under the same lock cancellation takes, so
+    /// cancellation cannot miss a just-started model call or device probe.
+    fn call_cancellable(
+        &mut self,
+        shared: &Shared,
+        request: &Request,
+        pcm: Option<&[f32]>,
+        deadline: Duration,
+        epoch: u64,
+    ) -> Result<Response, Failure> {
+        let frame = encode_request(request, pcm)?;
+        let sent = {
+            // Check, send and publish under the lock cancel() takes after
+            // bumping the epoch: either this sees the cancel and sends
+            // nothing, or the cancel sees the call and kills its worker.
+            let mut in_flight = lock(&shared.in_flight);
+            if shared.cancelled_since(epoch) {
+                return Err(Failure::Cancelled);
+            }
+            let sent = self.control.send(frame);
+            *in_flight = Some(InFlight {
+                what: request_name(request),
+                control: Arc::clone(&self.control),
+            });
+            sent
+        };
+        let result = if sent {
+            self.wait(request, deadline)
+        } else {
+            Err(self.died())
+        };
+        // Gone if cancel() took the call, which means it killed the worker
+        // (possibly just after it answered).
+        let killed = lock(&shared.in_flight).take().is_none();
+        if killed || shared.cancelled_since(epoch) {
+            return Err(Failure::Cancelled);
+        }
+        result
+    }
+
     /// Start a worker process. A `cpu_only` worker never registers a GPU
     /// backend.
     fn spawn(cpu_only: bool) -> io::Result<Self> {
@@ -1245,6 +1915,8 @@ impl Worker {
     fn wait(&mut self, request: &Request, deadline: Duration) -> Result<Response, Failure> {
         match self.responses.recv_timeout(deadline) {
             Ok(Response::Error(message)) => Err(Failure::Remote(message)),
+            Ok(Response::BackendError(message)) => Err(Failure::Backend(message)),
+            Ok(Response::AllocationError(message)) => Err(Failure::Allocation(message)),
             Ok(response) => Ok(response),
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 self.control.kill();
@@ -1468,6 +2140,426 @@ fn forward_worker_log(line: &str) {
 mod unit_tests {
     use super::*;
 
+    fn loaded(key: Option<&str>) -> LoadedInfo {
+        LoadedInfo {
+            arch: "test".into(),
+            variant: "test".into(),
+            backend: "test".into(),
+            device: key.unwrap_or("CPU").into(),
+            device_key: key.map(str::to_string),
+            on_gpu: key.is_some(),
+            supports_initial_prompt: false,
+            supports_long_form: false,
+            supports_vocabulary: false,
+            capabilities: transcribe_cpp::Capabilities {
+                native_sample_rate: 16000,
+                languages: vec![],
+                translate_target_languages: vec![],
+                max_timestamp_kind: transcribe_cpp::TimestampKind::None,
+                supports_language_detect: false,
+                supports_translate: false,
+                supports_streaming: false,
+                supports_spec_decode: false,
+                max_audio_ms: 0,
+            },
+        }
+    }
+
+    fn policy_owner() -> Owner {
+        Owner {
+            shared: Arc::new(Shared {
+                gpu_allowed: true,
+                ..Shared::default()
+            }),
+            worker: None,
+            spec: None,
+            stream: None,
+            unloads_done: 0,
+        }
+    }
+
+    #[test]
+    fn discovery_is_throttled_without_postponing_the_next_scan() {
+        let mut recheck = GpuRecheck::default();
+        let before = Instant::now();
+        recheck.schedule();
+        let first = recheck.next.unwrap();
+        assert!(first >= before + AUTO_DEVICE_RECHECK_INTERVAL);
+        assert!(!recheck.due());
+        recheck.schedule();
+        assert_eq!(recheck.next, Some(first));
+        recheck.next = Some(Instant::now());
+        assert!(recheck.due());
+    }
+
+    #[test]
+    fn repeated_enumeration_keeps_present_failed_gpu_blacklisted() {
+        let shared = Shared::default();
+        let devices = vec![gpu("failed", 12), gpu("healthy", 6)];
+        shared.set_devices(devices.clone());
+        shared.mark_gpu_failed("failed", "Failed GPU", "device lost");
+        for _ in 0..5 {
+            shared.set_devices(devices.clone());
+            assert_eq!(
+                shared.recovery_spec(&auto_spec()).device,
+                DeviceSelector::RecoveryKey("healthy".into())
+            );
+        }
+        assert!(lock(&shared.missing_failed_gpus).is_empty());
+    }
+
+    #[test]
+    fn only_observed_removal_and_return_releases_a_failed_device() {
+        let shared = Shared::default();
+        let devices = vec![gpu("returning", 12), gpu("unstable", 6)];
+        shared.set_devices(devices.clone());
+        shared.mark_gpu_failed("returning", "Returning GPU", "removed");
+        shared.mark_gpu_failed("unstable", "Unstable GPU", "driver fault");
+        shared.set_devices(vec![devices[1].clone()]);
+        assert!(lock(&shared.failed_gpus).contains_key("returning"));
+        shared.set_devices(devices);
+        assert!(!lock(&shared.failed_gpus).contains_key("returning"));
+        assert!(lock(&shared.failed_gpus).contains_key("unstable"));
+        assert_eq!(
+            shared.recovery_spec(&auto_spec()).device,
+            DeviceSelector::RecoveryKey("returning".into())
+        );
+    }
+
+    #[test]
+    fn removal_confirmed_before_failure_attribution_still_allows_return() {
+        let shared = Shared::default();
+        shared.set_devices(vec![gpu("healthy", 6)]);
+        shared.mark_gpu_failed("removed", "Removed GPU", "allocation on a removed GPU");
+        shared.set_devices(vec![gpu("removed", 12), gpu("healthy", 6)]);
+        assert!(!lock(&shared.failed_gpus).contains_key("removed"));
+        assert!(lock(&shared.missing_failed_gpus).is_empty());
+    }
+
+    #[test]
+    fn cpu_recovers_to_amd_when_saved_nvidia_is_absent() {
+        let preferred = LoadSpec {
+            device: DeviceSelector::Key("nvidia".into()),
+            ..auto_spec()
+        };
+        let devices = vec![gpu("amd", 2)];
+        let candidate = upgrade_candidate(&preferred, Some(&loaded(None)), &devices).unwrap();
+        assert_eq!(candidate.key, "amd");
+        assert_eq!(preferred.device, DeviceSelector::Key("nvidia".into()));
+        assert!(upgrade_candidate(&preferred, Some(&loaded(None)), &[]).is_none());
+    }
+
+    #[test]
+    fn recovery_scales_to_multiple_devices_without_vendor_assumptions() {
+        let preferred = LoadSpec {
+            device: DeviceSelector::Key("chosen".into()),
+            ..auto_spec()
+        };
+        let devices = vec![
+            gpu("chosen", 4),
+            gpu("integrated", 2),
+            gpu("external", 24),
+            gpu("discrete", 12),
+        ];
+        let mut failed = HashMap::from([("chosen".into(), "Chosen GPU".into())]);
+        for key in ["external", "discrete", "integrated"] {
+            let next = select_recovery_spec(&preferred, false, &failed, &devices);
+            assert_eq!(next.device, DeviceSelector::RecoveryKey(key.into()));
+            failed.insert(key.into(), key.into());
+        }
+        assert!(select_recovery_spec(&preferred, false, &failed, &devices).cpu_only());
+        // Recovery upgrades to the saved choice even when another device is larger.
+        assert_eq!(
+            upgrade_candidate(&preferred, Some(&loaded(None)), &devices)
+                .unwrap()
+                .key,
+            "chosen"
+        );
+        let missing = LoadSpec {
+            device: DeviceSelector::Key("absent".into()),
+            ..auto_spec()
+        };
+        assert_eq!(
+            upgrade_candidate(&missing, Some(&loaded(None)), &devices)
+                .unwrap()
+                .key,
+            "external"
+        );
+        assert_eq!(preferred.device, DeviceSelector::Key("chosen".into()));
+    }
+
+    #[test]
+    fn automatic_upgrade_prefers_saved_gpu_and_never_reloads_the_active_gpu() {
+        let preferred = LoadSpec {
+            device: DeviceSelector::Key("nvidia".into()),
+            ..auto_spec()
+        };
+        let devices = vec![gpu("amd", 12), gpu("nvidia", 6)];
+        assert_eq!(
+            upgrade_candidate(&preferred, Some(&loaded(Some("amd"))), &devices)
+                .unwrap()
+                .key,
+            "nvidia"
+        );
+        assert!(upgrade_candidate(&preferred, Some(&loaded(Some("nvidia"))), &devices).is_none());
+        assert!(upgrade_candidate(&preferred, Some(&loaded(Some("amd"))), &devices[..1]).is_none());
+        assert!(
+            upgrade_candidate(&auto_spec(), Some(&loaded(Some("amd"))), &devices).is_none(),
+            "Auto must not downgrade a healthy GPU"
+        );
+    }
+
+    #[test]
+    fn fallback_status_and_discovery_clear_when_preferred_device_returns() {
+        let owner = policy_owner();
+        let preferred = LoadSpec {
+            device: DeviceSelector::Key("nvidia".into()),
+            ..auto_spec()
+        };
+        owner.update_gpu_recheck(&preferred, &loaded(Some("amd")));
+        assert!(owner.shared.fallback_active.load(Ordering::Acquire));
+        assert!(lock(&owner.shared.gpu_recheck).next.is_some());
+        owner.shared.mark_gpu_failed("amd", "AMD", "old failure");
+        owner.update_gpu_recheck(&preferred, &loaded(Some("nvidia")));
+        assert!(!owner.shared.fallback_active.load(Ordering::Acquire));
+        assert!(
+            lock(&owner.shared.gpu_recheck).next.is_none(),
+            "unrelated failure history must not keep polling"
+        );
+    }
+
+    #[test]
+    fn backend_initialization_failure_requires_an_explicit_retry() {
+        let owner = policy_owner();
+        owner
+            .shared
+            .mark_gpu_unavailable("backend initialization crashed");
+        owner.update_gpu_recheck(&auto_spec(), &loaded(None));
+        assert!(!lock(&owner.shared.gpu_recheck).due());
+        assert!(lock(&owner.shared.gpu_recheck).next.is_none());
+        assert!(owner.shared.recovery_spec(&auto_spec()).cpu_only());
+    }
+
+    #[test]
+    fn healthy_auto_gpu_clears_fallback_without_releasing_failed_devices() {
+        let owner = policy_owner();
+        owner
+            .shared
+            .mark_gpu_failed("unstable", "Unstable GPU", "driver fault");
+        owner.update_gpu_recheck(&auto_spec(), &loaded(None));
+        assert!(owner.shared.fallback_active.load(Ordering::Acquire));
+        owner.update_gpu_recheck(&auto_spec(), &loaded(Some("healthy")));
+        assert!(!owner.shared.fallback_active.load(Ordering::Acquire));
+        assert!(owner.shared.device_restore_pending.load(Ordering::Acquire));
+        assert!(lock(&owner.shared.failed_gpus).contains_key("unstable"));
+        assert!(lock(&owner.shared.gpu_recheck).next.is_some());
+    }
+
+    #[test]
+    fn explicit_cpu_and_gpu_disabled_hosts_never_schedule_gpu_rechecks() {
+        let owner = policy_owner();
+        owner.update_gpu_recheck(&auto_spec().cpu(), &loaded(None));
+        assert!(!owner.shared.fallback_active.load(Ordering::Acquire));
+        assert!(lock(&owner.shared.gpu_recheck).next.is_none());
+        let owner = Owner {
+            shared: Arc::new(Shared::default()),
+            ..owner
+        };
+        owner.update_gpu_recheck(&auto_spec(), &loaded(None));
+        assert!(lock(&owner.shared.gpu_recheck).next.is_none());
+    }
+
+    #[test]
+    fn removal_requires_a_fresh_list_without_the_bound_identity() {
+        let mut gpu = DeviceInfo {
+            name: "GPU".into(),
+            description: "GPU".into(),
+            kind: "Vulkan".into(),
+            device_type: transcribe_cpp::DeviceType::Gpu,
+            device_id: Some("pci:01:00.0".into()),
+            memory_total: 0,
+            index: Some(0),
+            key: "bound-gpu-key".into(),
+        };
+        assert!(!device_missing("bound-gpu-key", None));
+        assert!(!device_missing(
+            "bound-gpu-key",
+            Some(std::slice::from_ref(&gpu))
+        ));
+        gpu.index = Some(1);
+        assert!(!device_missing(
+            "bound-gpu-key",
+            Some(std::slice::from_ref(&gpu))
+        ));
+        // A different GPU with the same label must not hide device removal.
+        gpu.key = "different-gpu-key".into();
+        assert!(device_missing("bound-gpu-key", Some(&[gpu])));
+        assert!(device_missing("bound-gpu-key", Some(&[])));
+    }
+
+    fn gpu(key: &str, memory: u64) -> DeviceInfo {
+        DeviceInfo {
+            name: key.into(),
+            description: key.into(),
+            kind: "vulkan".into(),
+            device_type: transcribe_cpp::DeviceType::Gpu,
+            device_id: Some(key.into()),
+            memory_total: memory,
+            index: Some(0),
+            key: key.into(),
+        }
+    }
+
+    #[test]
+    fn failed_nvidia_falls_back_to_amd_without_changing_the_preference() {
+        let preferred = LoadSpec {
+            device: DeviceSelector::Key("nvidia".into()),
+            ..auto_spec()
+        };
+        let devices = vec![gpu("nvidia", 6), gpu("amd", 2)];
+        let failed = HashMap::from([("nvidia".into(), "NVIDIA".into())]);
+        let recovery = select_recovery_spec(&preferred, false, &failed, &devices);
+        assert_eq!(recovery.device, DeviceSelector::RecoveryKey("amd".into()));
+        assert_eq!(recovery.backend, Backend::Auto);
+        assert_eq!(preferred.device, DeviceSelector::Key("nvidia".into()));
+        // Re-enumeration may remove NVIDIA and renumber AMD; selection uses identity.
+        let mut amd = gpu("amd", 2);
+        amd.index = Some(1);
+        assert_eq!(
+            select_recovery_spec(&preferred, false, &failed, &[amd]).device,
+            recovery.device
+        );
+    }
+
+    #[test]
+    fn cpu_fallback_is_used_only_when_no_healthy_gpu_remains() {
+        let devices = vec![gpu("nvidia", 6), gpu("amd", 2)];
+        let mut failed = HashMap::from([("nvidia".into(), "NVIDIA".into())]);
+        assert_eq!(
+            select_recovery_spec(&auto_spec(), false, &failed, &devices).device,
+            DeviceSelector::RecoveryKey("amd".into())
+        );
+        failed.insert("amd".into(), "AMD".into());
+        let recovery = select_recovery_spec(&auto_spec(), false, &failed, &devices);
+        assert_eq!(recovery.backend, Backend::Cpu);
+        assert_eq!(recovery.device, DeviceSelector::Auto);
+    }
+
+    #[test]
+    fn healthy_saved_gpu_wins_over_another_larger_gpu_during_recovery() {
+        let preferred = LoadSpec {
+            device: DeviceSelector::Key("amd".into()),
+            ..auto_spec()
+        };
+        let failed = HashMap::from([("nvidia".into(), "NVIDIA".into())]);
+        assert_eq!(
+            select_recovery_spec(
+                &preferred,
+                false,
+                &failed,
+                &[gpu("amd", 2), gpu("other", 12)]
+            )
+            .device,
+            DeviceSelector::RecoveryKey("amd".into())
+        );
+    }
+
+    #[test]
+    fn explicit_cpu_and_pinned_devices_are_preserved_and_init_faults_use_cpu() {
+        let failed = HashMap::from([("nvidia".into(), "NVIDIA".into())]);
+        let devices = vec![gpu("amd", 2)];
+        let cpu = auto_spec().cpu();
+        assert_eq!(
+            select_recovery_spec(&cpu, false, &failed, &devices).backend,
+            Backend::Cpu
+        );
+        let pinned = LoadSpec {
+            device: DeviceSelector::Index(2),
+            ..auto_spec()
+        };
+        assert_eq!(
+            select_recovery_spec(&pinned, true, &failed, &devices).device,
+            pinned.device
+        );
+        assert_eq!(
+            select_recovery_spec(&auto_spec(), true, &failed, &devices).backend,
+            Backend::Cpu
+        );
+    }
+
+    #[test]
+    fn per_gpu_recovery_notifies_once_and_retry_clears_its_quarantine() {
+        let engine = EngineSupervisor::new(true);
+        assert!(engine
+            .shared
+            .mark_gpu_failed("nvidia", "NVIDIA RTX", "test"));
+        assert!(!engine.shared.gpu_unavailable());
+        assert!(engine.shared.has_gpu_failures());
+        // Failure history alone is not an active fallback with no model.
+        assert!(!engine.is_in_fallback());
+        assert_eq!(
+            engine.failed_gpu_devices(),
+            vec![("nvidia".into(), "NVIDIA RTX".into())]
+        );
+        assert!(engine.shared.take_device_fallback(&auto_spec()));
+        assert!(!engine.shared.take_device_fallback(&auto_spec()));
+        engine.retry_gpu("user explicitly selected a device");
+        assert!(!engine.is_in_fallback());
+        assert!(engine.failed_gpu_devices().is_empty());
+        assert_eq!(
+            engine.shared.recovery_spec(&auto_spec()).device,
+            DeviceSelector::Auto
+        );
+    }
+
+    #[test]
+    fn only_context_failures_require_worker_replacement() {
+        assert!(Failure::Backend("device lost".into()).requires_restart());
+        assert!(Failure::Crashed("abort".into()).requires_restart());
+        assert!(Failure::Hung(Duration::from_secs(1)).requires_restart());
+        assert!(!Failure::Remote("backend error: device lost".into()).requires_restart());
+        assert!(!Failure::Cancelled.requires_restart());
+        assert!(!Failure::Allocation("device lost".into()).requires_restart());
+        assert!(!Failure::Spawn(io::Error::other("could not spawn")).requires_restart());
+    }
+
+    fn auto_spec() -> LoadSpec {
+        LoadSpec {
+            path: "model.gguf".into(),
+            backend: Backend::Auto,
+            device: DeviceSelector::Auto,
+        }
+    }
+
+    #[test]
+    fn fallback_notification_is_once_per_gpu_failure_and_not_for_explicit_devices() {
+        let shared = Shared::default();
+        let spec = auto_spec();
+        assert!(!shared.take_device_fallback(&spec));
+        shared.mark_gpu_unavailable("test failure");
+        assert!(!shared.take_device_fallback(&spec.cpu()));
+        let pinned = LoadSpec {
+            device: DeviceSelector::Index(0),
+            ..spec.clone()
+        };
+        assert!(!shared.take_device_fallback(&pinned));
+        assert!(shared.take_device_fallback(&spec));
+        // Repeated reports and later model loads do not repeat the notification.
+        shared.mark_gpu_unavailable("same failure");
+        assert!(!shared.take_device_fallback(&spec));
+    }
+
+    #[test]
+    fn retrying_gpu_discards_the_old_notification_and_allows_a_new_failure() {
+        let engine = EngineSupervisor::new(true);
+        let spec = auto_spec();
+        engine.shared.mark_gpu_unavailable("old failure");
+        engine.retry_gpu("user changed the accelerator");
+        assert!(!engine.shared.take_device_fallback(&spec));
+        engine.shared.mark_gpu_unavailable("new failure");
+        assert!(engine.shared.take_device_fallback(&spec));
+    }
+
     #[test]
     fn deadlines_scale_with_the_audio_above_a_floor() {
         let gpu = Deadlines::for_device(true);
@@ -1495,13 +2587,6 @@ mod unit_tests {
     }
 }
 
-/// End-to-end checks against a real worker and model. Crash and hang tests
-/// need a debug worker exe (fault injection is compiled out of release), and
-/// the stream tests a model that can stream.
-/// Run with:
-/// `HANDY_TRANSCRIBE_WORKER_EXE=target/debug/handy HANDY_TEST_MODEL=<gguf>
-///  HANDY_TEST_WAV=<16 kHz mono wav> cargo test --lib engine_supervisor --
-///  --ignored --nocapture --test-threads=1`
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1526,6 +2611,7 @@ mod tests {
     fn set_fault(fault: Option<&str>, gpu_only: bool) {
         let marker = std::env::temp_dir().join("handy-worker-fault-once");
         let _ = std::fs::remove_file(&marker);
+        std::env::remove_var("HANDY_WORKER_LOAD_ERRORS");
         std::env::remove_var("HANDY_WORKER_FAULT_ONCE");
         std::env::remove_var("HANDY_WORKER_FAULT_GPU_ONLY");
         match fault {
@@ -1783,11 +2869,253 @@ mod tests {
             .unwrap();
     }
 
-    /// A crash that only happens on the GPU: the dictation succeeds on CPU,
-    /// the GPU is marked unavailable, and later loads use CPU.
+    fn named_gpu(engine: &EngineSupervisor, name: &str) -> DeviceInfo {
+        engine
+            .devices()
+            .unwrap()
+            .into_iter()
+            .find(|device| device.is_gpu() && device.label().contains(name))
+            .unwrap_or_else(|| panic!("test requires {name}"))
+    }
+
+    fn expire_device_discovery(engine: &EngineSupervisor) {
+        lock(&engine.shared.gpu_recheck).next = Some(Instant::now());
+    }
+
+    /// Driver faults leave a present GPU blacklisted across discovery scans.
+    /// A real worker proves both fallback dictation and explicit retry still work.
     #[test]
     #[ignore]
-    fn gpu_only_crash_recovers_on_cpu() {
+    fn present_failed_gpu_stays_on_fallback_until_explicit_retry() {
+        set_fault(None, false);
+        let engine = EngineSupervisor::new(true);
+        let nvidia = named_gpu(&engine, "NVIDIA");
+        let preferred = LoadSpec {
+            device: DeviceSelector::Key(nvidia.key.clone()),
+            ..spec()
+        };
+        set_fault(Some("abort@run"), false);
+        engine.load(preferred.clone()).unwrap();
+        assert!(!engine
+            .transcribe(test_pcm(), RunOptions::default())
+            .unwrap()
+            .text
+            .trim()
+            .is_empty());
+        let fallback = engine.loaded().unwrap();
+        assert_ne!(fallback.device_key.as_ref(), Some(&nvidia.key));
+        set_fault(None, false);
+        for _ in 0..3 {
+            expire_device_discovery(&engine);
+            assert!(engine.recheck_gpu().unwrap().is_none());
+            assert_eq!(engine.loaded().unwrap().device_key, fallback.device_key);
+            assert!(!engine
+                .transcribe(test_pcm(), RunOptions::default())
+                .unwrap()
+                .text
+                .trim()
+                .is_empty());
+        }
+        engine.retry_gpu("user explicitly retried the accelerator");
+        assert_eq!(
+            engine.load(preferred).unwrap().device_key.as_ref(),
+            Some(&nvidia.key)
+        );
+        engine.unload().wait();
+    }
+
+    #[test]
+    #[ignore]
+    fn observed_gpu_return_notifies_only_after_stream_finalize() {
+        set_fault(None, false);
+        let restored_events = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = restored_events.clone();
+        let engine = EngineSupervisor::with_device_handlers(
+            true,
+            |_| {},
+            move |_| {
+                count.fetch_add(1, Ordering::SeqCst);
+            },
+        );
+        let gpu = named_gpu(&engine, "NVIDIA");
+        let devices = engine.devices().unwrap();
+        let preferred = LoadSpec {
+            device: DeviceSelector::Key(gpu.key.clone()),
+            ..spec()
+        };
+        engine
+            .shared
+            .mark_gpu_failed(&gpu.key, gpu.label(), "removed");
+        engine
+            .shared
+            .set_devices(devices.into_iter().filter(|d| d.key != gpu.key).collect());
+        // Load CPU directly so the returning device is first observed by discovery.
+        // Keep the original preference on the owner, as physical fallback does.
+        engine.shared.gpu_unavailable.store(true, Ordering::Release);
+        engine.load(preferred).unwrap();
+        engine
+            .shared
+            .gpu_unavailable
+            .store(false, Ordering::Release);
+        expire_device_discovery(&engine);
+        assert_eq!(
+            engine.recheck_gpu().unwrap().unwrap().device_key.as_ref(),
+            Some(&gpu.key)
+        );
+        assert_eq!(restored_events.load(Ordering::SeqCst), 0);
+        let stream = engine
+            .start_stream(RunOptions::default(), StreamOptions::default(), |_| {})
+            .unwrap();
+        feed_paced(&stream, &test_pcm());
+        assert_eq!(restored_events.load(Ordering::SeqCst), 0);
+        assert!(!stream
+            .finalize(false)
+            .unwrap()
+            .unwrap()
+            .text
+            .full
+            .trim()
+            .is_empty());
+        assert_eq!(restored_events.load(Ordering::SeqCst), 1);
+        stream_all(&engine, &test_pcm()).unwrap();
+        assert_eq!(restored_events.load(Ordering::SeqCst), 1);
+        engine.unload().wait();
+    }
+
+    #[test]
+    #[ignore]
+    fn optional_upgrade_load_errors_preserve_working_cpu() {
+        set_fault(None, false);
+        let engine = EngineSupervisor::new(true);
+        let nvidia = named_gpu(&engine, "NVIDIA");
+        let amd = named_gpu(&engine, "AMD");
+        let preferred = LoadSpec {
+            device: DeviceSelector::Key(nvidia.key.clone()),
+            ..spec()
+        };
+        engine
+            .shared
+            .mark_gpu_unavailable("test previous backend failure");
+        assert!(!engine.load(preferred).unwrap().on_gpu);
+        engine.retry_gpu("user retry");
+        std::env::set_var(
+            "HANDY_WORKER_LOAD_ERRORS",
+            serde_json::to_string(&HashMap::from([
+                (nvidia.key.clone(), "backend"),
+                (amd.key.clone(), "allocation"),
+            ]))
+            .unwrap(),
+        );
+        expire_device_discovery(&engine);
+        assert!(!engine.recheck_gpu().unwrap().unwrap().on_gpu);
+        assert!(lock(&engine.shared.failed_gpus).contains_key(&amd.key));
+        assert!(!engine
+            .transcribe(test_pcm(), RunOptions::default())
+            .unwrap()
+            .text
+            .trim()
+            .is_empty());
+        set_fault(None, false);
+        engine.unload().wait();
+    }
+
+    #[test]
+    #[ignore]
+    fn returning_gpu_oom_restores_previous_gpu_then_cpu_if_needed() {
+        set_fault(None, false);
+        let engine = EngineSupervisor::new(true);
+        let nvidia = named_gpu(&engine, "NVIDIA");
+        let amd = named_gpu(&engine, "AMD");
+        let preferred = LoadSpec {
+            device: DeviceSelector::Key(nvidia.key.clone()),
+            ..spec()
+        };
+        engine
+            .shared
+            .mark_gpu_failed(&nvidia.key, nvidia.label(), "test previous failure");
+        assert_eq!(
+            engine.load(preferred.clone()).unwrap().device_key.as_ref(),
+            Some(&amd.key)
+        );
+        std::env::set_var(
+            "HANDY_WORKER_LOAD_ERRORS",
+            serde_json::to_string(&HashMap::from([(nvidia.key.clone(), "allocation")])).unwrap(),
+        );
+        // Simulate a confirmed off/on transition before each fresh attempt.
+        engine.shared.set_devices(vec![amd.clone()]);
+        expire_device_discovery(&engine);
+        assert_eq!(
+            engine.recheck_gpu().unwrap().unwrap().device_key.as_ref(),
+            Some(&amd.key)
+        );
+        assert!(!engine
+            .transcribe(test_pcm(), RunOptions::default())
+            .unwrap()
+            .text
+            .trim()
+            .is_empty());
+        std::env::set_var(
+            "HANDY_WORKER_LOAD_ERRORS",
+            serde_json::to_string(&HashMap::from([
+                (nvidia.key.clone(), "allocation"),
+                (amd.key.clone(), "allocation"),
+            ]))
+            .unwrap(),
+        );
+        // Simulate a confirmed off/on transition before each fresh attempt.
+        engine.shared.set_devices(vec![amd.clone()]);
+        expire_device_discovery(&engine);
+        assert!(
+            !engine.recheck_gpu().unwrap().unwrap().on_gpu,
+            "failed GPU restoration must still try CPU"
+        );
+        assert!(!engine
+            .transcribe(test_pcm(), RunOptions::default())
+            .unwrap()
+            .text
+            .trim()
+            .is_empty());
+        set_fault(None, false);
+        engine.unload().wait();
+    }
+
+    #[test]
+    #[ignore]
+    fn idle_model_unload_does_not_release_a_failed_present_gpu() {
+        set_fault(None, false);
+        let engine = EngineSupervisor::new(true);
+        let nvidia = named_gpu(&engine, "NVIDIA");
+        let preferred = LoadSpec {
+            device: DeviceSelector::Key(nvidia.key.clone()),
+            ..spec()
+        };
+        engine
+            .shared
+            .mark_gpu_failed(&nvidia.key, nvidia.label(), "driver fault");
+        assert_ne!(
+            engine.load(preferred.clone()).unwrap().device_key.as_ref(),
+            Some(&nvidia.key)
+        );
+        expire_device_discovery(&engine);
+        engine.unload().wait();
+        assert_ne!(
+            engine.load(preferred).unwrap().device_key.as_ref(),
+            Some(&nvidia.key)
+        );
+        assert!(!engine
+            .transcribe(test_pcm(), RunOptions::default())
+            .unwrap()
+            .text
+            .trim()
+            .is_empty());
+        engine.unload().wait();
+    }
+
+    /// A GPU-only crash retries the dictation on another healthy device.
+    /// Failed GPUs stay excluded until an explicit retry or an observed removal and return.
+    #[test]
+    #[ignore]
+    fn gpu_only_crash_recovers_on_another_device() {
         let pcm = test_pcm();
         set_fault(Some("abort@run"), true);
         let engine = EngineSupervisor::new(true);
@@ -1796,13 +3124,19 @@ mod tests {
         let transcript = engine
             .transcribe(pcm.clone(), RunOptions::default())
             .unwrap();
-        println!("recovered on CPU: {}", transcript.text);
-        assert!(engine.shared.gpu_unavailable());
-        assert!(!engine.loaded().unwrap().on_gpu);
+        println!(
+            "recovered on {}: {}",
+            engine.loaded().unwrap().device,
+            transcript.text
+        );
+        assert!(engine.shared.has_gpu_failures());
+        assert_ne!(engine.loaded().unwrap().device_key, info.device_key);
         let info = engine.load(spec()).unwrap();
         assert!(
-            !info.on_gpu,
-            "loads stay on CPU while the GPU is marked unavailable"
+            !info.on_gpu
+                || !lock(&engine.shared.failed_gpus)
+                    .contains_key(info.device_key.as_deref().unwrap_or_default()),
+            "later loads must not reuse a failed GPU"
         );
         engine.transcribe(pcm, RunOptions::default()).unwrap();
         set_fault(None, false);

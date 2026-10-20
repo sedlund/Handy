@@ -45,6 +45,11 @@ fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
+#[derive(Clone, Serialize)]
+struct TranscriptionDeviceEvent {
+    device_name: String,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct ModelStateEvent {
     pub event_type: String,
@@ -267,8 +272,32 @@ pub struct TranscriptionManager {
 
 impl TranscriptionManager {
     pub fn new(app_handle: &AppHandle, model_manager: Arc<ModelManager>) -> Result<Self> {
+        let fallback_app = app_handle.clone();
+        let restored_app = app_handle.clone();
         let manager = Self {
-            engine: EngineSupervisor::new(!transcribe_gpu_disabled_for_host()),
+            engine: EngineSupervisor::with_device_handlers(
+                !transcribe_gpu_disabled_for_host(),
+                move |info| {
+                    let _ = fallback_app.emit(
+                        "transcription-device-fallback",
+                        TranscriptionDeviceEvent {
+                            device_name: if info.on_gpu {
+                                info.device.clone()
+                            } else {
+                                "cpu".to_string()
+                            },
+                        },
+                    );
+                },
+                move |info| {
+                    let _ = restored_app.emit(
+                        "transcription-device-restored",
+                        TranscriptionDeviceEvent {
+                            device_name: info.device.clone(),
+                        },
+                    );
+                },
+            ),
             model_manager,
             app_handle: app_handle.clone(),
             current_model_id: Arc::new(Mutex::new(None)),
@@ -670,7 +699,8 @@ impl TranscriptionManager {
         }
 
         let reload_pending = self.reload_model_on_next_use.load(Ordering::Acquire);
-        if !reload_pending && self.is_model_loaded() {
+        let already_loaded = self.is_model_loaded();
+        if !reload_pending && already_loaded && !self.engine.gpu_recheck_due() {
             return;
         }
 
@@ -683,7 +713,29 @@ impl TranscriptionManager {
                     .store(false, Ordering::Release);
             }
             let settings = get_settings(&self_clone.app_handle);
-            if let Err(e) = self_clone.load_model(&settings.selected_model) {
+            if already_loaded && !reload_pending {
+                match self_clone.engine.recheck_gpu() {
+                    Ok(Some(_)) => {
+                        let _ = self_clone.app_handle.emit(
+                            "model-state-changed",
+                            ModelStateEvent {
+                                event_type: "loading_completed".to_string(),
+                                model_id: Some(settings.selected_model.clone()),
+                                model_name: None,
+                                error: None,
+                            },
+                        );
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        error!("Automatic GPU recheck failed: {}", error);
+                        self_clone.forget_model_if_engine_dropped(
+                            &settings.selected_model,
+                            &error.to_string(),
+                        );
+                    }
+                }
+            } else if let Err(e) = self_clone.load_model(&settings.selected_model) {
                 error!("Failed to load model: {}", e);
             }
             let mut is_loading = self_clone.is_loading.lock().unwrap();
@@ -768,6 +820,13 @@ impl TranscriptionManager {
             }
         }
 
+        // If recording ended while the model/device was being prepared,
+        // decode the canonical full recording. Starting a live decoder now
+        // provides no preview and can differ from whole-recording inference.
+        let Some(commands) = prepare_stream_commands(rx) else {
+            debug!("Recording finished during model preparation; transcribing full recording");
+            return;
+        };
         let model_id = self.get_current_model().unwrap_or_default();
 
         // The loaded model (not the ModelManager copy) is the source of truth
@@ -779,7 +838,7 @@ impl TranscriptionManager {
                 model_id
             );
             self.router.clear();
-            drain_until_finalize(rx);
+            drain_until_finalize(commands);
             return;
         };
         let caps = &info.capabilities;
@@ -800,12 +859,12 @@ impl TranscriptionManager {
         let Some(mut session) = LiveSession::begin(self, mode, &info, &model_id) else {
             // Nothing to decode live: the recording is transcribed in batch.
             self.router.clear();
-            drain_until_finalize(rx);
+            drain_until_finalize(commands);
             return;
         };
         self.touch_activity();
 
-        while let Ok(cmd) = rx.recv() {
+        for cmd in commands {
             match cmd {
                 StreamCmd::Feed(pcm) => {
                     // Audio queued ahead of a cancel is dropped, not decoded.
@@ -1627,12 +1686,34 @@ fn cpp_translation_task(
     }
 }
 
+type StreamCommands = std::iter::Chain<std::vec::IntoIter<StreamCmd>, mpsc::IntoIter<StreamCmd>>;
+
+/// Preserve FIFO order across the backlog and newly arriving audio. A
+/// completed recording goes through full-clip inference instead of streaming.
+/// Discovery or model recovery can outlast a short recording. Starting a live
+/// decoder after finalize was already queued can change opening-word recognition;
+/// the recorder's full clip is the batch source in that case. If capture is still
+/// active, replay the backlog before new frames so the opening audio survives.
+fn prepare_stream_commands(rx: mpsc::Receiver<StreamCmd>) -> Option<StreamCommands> {
+    let pending: Vec<_> = rx.try_iter().collect();
+    let finished = pending
+        .iter()
+        .any(|cmd| matches!(cmd, StreamCmd::Finalize { .. } | StreamCmd::Cancel));
+    let commands = pending.into_iter().chain(rx);
+    if finished {
+        drain_until_finalize(commands);
+        None
+    } else {
+        Some(commands)
+    }
+}
+
 /// Drain a stream command channel, ignoring fed audio, until the caller
 /// finalizes or cancels. Used when streaming can't actually run (model not
 /// loaded / not streaming-capable) so the finalize handshake still completes
 /// and the caller falls back to batch transcription.
-fn drain_until_finalize(rx: mpsc::Receiver<StreamCmd>) {
-    while let Ok(cmd) = rx.recv() {
+fn drain_until_finalize(commands: impl IntoIterator<Item = StreamCmd>) {
+    for cmd in commands {
         match cmd {
             StreamCmd::Feed(_) => {}
             StreamCmd::Finalize { reply, .. } => {
@@ -1737,6 +1818,7 @@ pub struct GpuDeviceOption {
     pub id: String,
     pub name: String,
     pub total_vram_mb: usize,
+    pub available: bool,
 }
 
 fn transcribe_gpu_disabled_for_host() -> bool {
@@ -1776,7 +1858,7 @@ fn gpu_device_options(engine: &EngineSupervisor) -> Vec<GpuDeviceOption> {
     // process-local registry index. It uses the backend's device_id where
     // available and its name otherwise (Metal). `total_vram_mb` is 0 when the
     // backend does not report capacity. Empty if listing failed.
-    transcribe_compute_devices(engine)
+    let mut options: Vec<_> = transcribe_compute_devices(engine)
         .unwrap_or_default()
         .into_iter()
         .filter(DeviceInfo::is_gpu)
@@ -1784,29 +1866,203 @@ fn gpu_device_options(engine: &EngineSupervisor) -> Vec<GpuDeviceOption> {
             id: d.key.clone(),
             name: d.label().to_string(),
             total_vram_mb: (d.memory_total / (1024 * 1024)) as usize,
+            available: true,
         })
-        .collect()
+        .collect();
+    // Keep the saved preference identifiable after its GPU disappears.
+    for (id, name) in engine.failed_gpu_devices() {
+        if !options.iter().any(|option| option.id == id) {
+            options.push(GpuDeviceOption {
+                id,
+                name,
+                total_vram_mb: 0,
+                available: false,
+            });
+        }
+    }
+    options
+}
+
+#[derive(Serialize, Clone, Debug, Type)]
+pub struct ActiveTranscriptionDevice {
+    pub name: String,
+    pub on_gpu: bool,
+    pub is_fallback: bool,
 }
 
 #[derive(Serialize, Clone, Debug, Type)]
 pub struct AvailableAccelerators {
     pub transcribe: Vec<String>,
     pub gpu_devices: Vec<GpuDeviceOption>,
+    pub active_device: Option<ActiveTranscriptionDevice>,
 }
 
 /// Return the accelerators available to this process on its current host.
 pub fn get_available_accelerators(tm: &TranscriptionManager) -> AvailableAccelerators {
     let transcribe_options = available_transcribe_accelerators(transcribe_gpu_disabled_for_host());
 
+    let settings = get_settings(&tm.app_handle);
+    let mut gpu_devices = gpu_device_options(&tm.engine);
+    if let Some(preferred) = &settings.transcribe_gpu_device {
+        if !gpu_devices.iter().any(|device| &device.id == preferred) {
+            gpu_devices.push(GpuDeviceOption {
+                id: preferred.clone(),
+                name: String::new(),
+                total_vram_mb: 0,
+                available: false,
+            });
+        }
+    }
+    let active_device = tm.engine.loaded().map(|info| {
+        let preferred_missing = settings.transcribe_accelerator
+            == TranscribeAcceleratorSetting::Gpu
+            && settings
+                .transcribe_gpu_device
+                .as_deref()
+                .is_some_and(|key| info.device_key.as_deref() != Some(key));
+        ActiveTranscriptionDevice {
+            name: info.device,
+            on_gpu: info.on_gpu,
+            is_fallback: tm.engine.is_in_fallback() || preferred_missing,
+        }
+    });
     AvailableAccelerators {
         transcribe: transcribe_options,
-        gpu_devices: gpu_device_options(&tm.engine),
+        gpu_devices,
+        active_device,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queued_recording_keeps_all_samples_before_finalize() {
+        let router = StreamRouter::new();
+        let (rx, _) = router.open();
+        let prefix: Vec<_> = (0..16640).map(|sample| sample as f32).collect();
+        for frame in prefix.chunks(256) {
+            router.feed(frame);
+        }
+        let commands = prepare_stream_commands(rx).expect("recording is still active");
+        let route = router.take().unwrap();
+        let (reply, _) = mpsc::channel();
+        route
+            .tx
+            .send(StreamCmd::Finalize {
+                reply,
+                samples: prefix.len(),
+            })
+            .unwrap();
+        let mut received = Vec::new();
+        for command in commands {
+            match command {
+                StreamCmd::Feed(frame) => received.extend(frame),
+                StreamCmd::Finalize { samples, .. } => {
+                    assert_eq!(samples, received.len());
+                    break;
+                }
+                StreamCmd::Cancel => panic!("unexpected cancel"),
+            }
+        }
+        assert_eq!(
+            received, prefix,
+            "the first samples must survive model startup"
+        );
+    }
+
+    #[test]
+    fn recording_finished_before_model_ready_requests_full_recording() {
+        let router = StreamRouter::new();
+        let (rx, _) = router.open();
+        router.feed(&[1.0, 2.0, 3.0]);
+        let route = router.take().unwrap();
+        let (reply, result) = mpsc::channel();
+        route
+            .tx
+            .send(StreamCmd::Finalize { reply, samples: 3 })
+            .unwrap();
+        assert!(prepare_stream_commands(rx).is_none());
+        assert!(
+            result.recv().unwrap().unwrap().is_none(),
+            "the caller must batch the canonical full recording"
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn queued_short_recording_during_gpu_load_preserves_first_word() {
+        use crate::engine_supervisor::{DeviceSelector, LoadSpec};
+        use std::path::PathBuf;
+        let engine = Arc::new(EngineSupervisor::new(true));
+        let model =
+            PathBuf::from(std::env::var_os("HANDY_TEST_MODEL").expect("set HANDY_TEST_MODEL"));
+        let audio = crate::audio_toolkit::read_wav_samples(PathBuf::from(
+            std::env::var_os("HANDY_TEST_SHORT_WAV").expect("set HANDY_TEST_SHORT_WAV"),
+        ))
+        .unwrap();
+        let cpu = LoadSpec {
+            path: model.clone(),
+            backend: Backend::Cpu,
+            device: DeviceSelector::Auto,
+        };
+        assert!(!engine.load(cpu).unwrap().on_gpu);
+        let gpu = engine
+            .devices()
+            .unwrap()
+            .into_iter()
+            .filter(DeviceInfo::is_gpu)
+            .max_by_key(|device| device.memory_total)
+            .expect("test requires a GPU");
+        let router = StreamRouter::new();
+        let (rx, _) = router.open();
+        let (release, wait) = mpsc::channel();
+        let loading_engine = engine.clone();
+        let worker = thread::spawn(move || {
+            wait.recv().unwrap();
+            let info = loading_engine
+                .load(LoadSpec {
+                    path: model,
+                    backend: Backend::Auto,
+                    device: DeviceSelector::Key(gpu.key),
+                })
+                .unwrap();
+            assert!(info.on_gpu);
+            assert!(
+                prepare_stream_commands(rx).is_none(),
+                "finished queued audio must use full-clip inference"
+            );
+        });
+        // All of the recording, including its opening word and finalize,
+        // arrives while GPU model loading has not finished.
+        for frame in audio.chunks(256) {
+            router.feed(frame);
+        }
+        let route = router.take().unwrap();
+        let (reply, result) = mpsc::channel();
+        route
+            .tx
+            .send(StreamCmd::Finalize {
+                reply,
+                samples: audio.len(),
+            })
+            .unwrap();
+        release.send(()).unwrap();
+        assert!(result.recv().unwrap().unwrap().is_none());
+        worker.join().unwrap();
+        let result = engine.transcribe(audio, RunOptions::default()).unwrap();
+        assert!(
+            result.text.trim().to_lowercase().starts_with("how"),
+            "first word missing: {}",
+            result.text
+        );
+        println!(
+            "Queued recording survived CPU-to-GPU switch: {}",
+            result.text
+        );
+        engine.unload().wait();
+    }
 
     fn languages(codes: &[&str]) -> Vec<String> {
         codes.iter().map(|code| (*code).to_string()).collect()

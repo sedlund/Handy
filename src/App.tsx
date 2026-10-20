@@ -10,10 +10,19 @@ import { useTranslation } from "react-i18next";
 import { listen } from "@tauri-apps/api/event";
 import { platform } from "@tauri-apps/plugin-os";
 import {
+  isPermissionGranted,
+  requestPermission,
+  sendNotification,
+} from "@tauri-apps/plugin-notification";
+import {
   checkAccessibilityPermission,
   checkMicrophonePermission,
 } from "tauri-plugin-macos-permissions-api";
-import { ModelStateEvent, RecordingErrorEvent } from "./lib/types/events";
+import {
+  TranscriptionDeviceEvent,
+  ModelStateEvent,
+  RecordingErrorEvent,
+} from "./lib/types/events";
 import "./App.css";
 import AccessibilityPermissions from "./components/AccessibilityPermissions";
 import SecureInputWarning from "./components/SecureInputWarning";
@@ -199,6 +208,56 @@ function App() {
     });
     return () => {
       unlisten.then((fn) => fn());
+    };
+  }, [t]);
+
+  // Device changes may happen while Settings is hidden.
+  useEffect(() => {
+    const notify = async (deviceName: string, restored: boolean) => {
+      const device = deviceName === "cpu" ? t("errors.backupCpu") : deviceName;
+      try {
+        let granted = await isPermissionGranted();
+        if (!granted) granted = (await requestPermission()) === "granted";
+        if (granted) {
+          await sendNotification({
+            title: t(
+              restored
+                ? "errors.deviceRestoredTitle"
+                : "errors.deviceFallbackTitle",
+            ),
+            body: t(
+              restored
+                ? "errors.deviceRestoredDescription"
+                : "errors.deviceFallbackDescription",
+              { device },
+            ),
+          });
+        }
+      } catch (error) {
+        console.error(
+          "Failed to show transcription device notification:",
+          error,
+        );
+      }
+    };
+    const subscriptions = [
+      listen<TranscriptionDeviceEvent>(
+        "transcription-device-fallback",
+        (event) => {
+          void notify(event.payload.device_name, false);
+        },
+      ),
+      listen<TranscriptionDeviceEvent>(
+        "transcription-device-restored",
+        (event) => {
+          void notify(event.payload.device_name, true);
+        },
+      ),
+    ];
+    return () => {
+      for (const subscription of subscriptions) {
+        void subscription.then((unlisten) => unlisten()).catch(console.error);
+      }
     };
   }, [t]);
 

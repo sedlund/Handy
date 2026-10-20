@@ -1,10 +1,15 @@
-import { type FC, useEffect, useState } from "react";
+import { type FC, useEffect, useRef, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { useTranslation } from "react-i18next";
 import { SettingContainer } from "../ui/SettingContainer";
 import { Dropdown, type DropdownOption } from "../ui/Dropdown";
 import { useSettings } from "../../hooks/useSettings";
 import { commands } from "@/bindings";
-import type { TranscribeAcceleratorSetting } from "@/bindings";
+import type {
+  ActiveTranscriptionDevice,
+  TranscribeAcceleratorSetting,
+} from "@/bindings";
+import type { ModelStateEvent } from "@/lib/types/events";
 
 interface AccelerationSelectorProps {
   descriptionMode?: "tooltip" | "inline";
@@ -44,52 +49,94 @@ export const AccelerationSelector: FC<AccelerationSelectorProps> = ({
   const { t } = useTranslation();
   const { getSetting, updateSetting, isUpdating } = useSettings();
 
-  const [transcribeOptions, setTranscribeOptions] = useState<DropdownOption[]>(
-    [],
-  );
-
-  useEffect(() => {
-    commands.getAvailableAccelerators().then((available) => {
-      // Build combined transcribe.cpp options: Auto, [GPU devices...], CPU
-      const opts: DropdownOption[] = [];
-      if (available.transcribe.includes("auto")) {
-        opts.push({
-          value: "auto",
-          label: t("settings.advanced.acceleration.gpuDevice.auto"),
-        });
-      }
-
-      if (available.transcribe.includes("gpu")) {
-        for (const dev of available.gpu_devices) {
-          const vramLabel =
-            dev.total_vram_mb >= 1024
-              ? `${(dev.total_vram_mb / 1024).toFixed(1)} GB`
-              : `${dev.total_vram_mb} MB`;
-          opts.push({
-            value: `gpu:${dev.id}`,
-            label: `${dev.name} (${vramLabel})`,
-          });
-        }
-      }
-
-      if (available.transcribe.includes("cpu")) {
-        opts.push({ value: "cpu", label: "CPU" });
-      }
-      setTranscribeOptions(opts);
-    });
-  }, [t]);
-
   const currentAccelerator = getSetting("transcribe_accelerator") ?? "auto";
   const currentGpuDevice = getSetting("transcribe_gpu_device") ?? null;
   const currentTranscribe = encodeTranscribeValue(
     currentAccelerator as TranscribeAcceleratorSetting,
     currentGpuDevice as string | null,
   );
-  const displayedTranscribe = transcribeOptions.some(
-    (option) => option.value === currentTranscribe,
-  )
-    ? currentTranscribe
-    : (transcribeOptions[0]?.value ?? null);
+  const [transcribeOptions, setTranscribeOptions] = useState<DropdownOption[]>(
+    [],
+  );
+  const [activeDevice, setActiveDevice] =
+    useState<ActiveTranscriptionDevice | null>(null);
+  const refreshRef = useRef<() => void>(() => {});
+
+  useEffect(() => {
+    let disposed = false;
+    let requestId = 0;
+    const refresh = async () => {
+      const request = ++requestId;
+      try {
+        const available = await commands.getAvailableAccelerators();
+        if (disposed || request !== requestId) return;
+        const opts: DropdownOption[] = [];
+        if (available.transcribe.includes("auto")) {
+          opts.push({
+            value: "auto",
+            label: t("settings.advanced.acceleration.gpuDevice.auto"),
+          });
+        }
+        for (const dev of available.gpu_devices) {
+          const name =
+            dev.name || t("settings.advanced.acceleration.preferredGpu");
+          const vramLabel =
+            dev.total_vram_mb >= 1024
+              ? `${(dev.total_vram_mb / 1024).toFixed(1)} GB`
+              : `${dev.total_vram_mb} MB`;
+          opts.push({
+            value: `gpu:${dev.id}`,
+            label: dev.available
+              ? `${name} (${vramLabel})`
+              : t("settings.advanced.acceleration.unavailableDevice", {
+                  device: name,
+                }),
+          });
+        }
+        if (available.transcribe.includes("cpu")) {
+          opts.push({ value: "cpu", label: "CPU" });
+        }
+        setTranscribeOptions(opts);
+        setActiveDevice(available.active_device);
+      } catch (error) {
+        if (!disposed)
+          console.error("Failed to refresh transcription devices:", error);
+      }
+    };
+    refreshRef.current = () => {
+      void refresh();
+    };
+    const fallback = listen("transcription-device-fallback", () => {
+      void refresh();
+    });
+    const modelState = listen<ModelStateEvent>(
+      "model-state-changed",
+      (event) => {
+        if (
+          ["loading_completed", "unloaded", "loading_failed"].includes(
+            event.payload.event_type,
+          )
+        ) {
+          void refresh();
+        }
+      },
+    );
+    void Promise.all([fallback, modelState])
+      .then(() => refresh())
+      .catch((error) => {
+        console.error(
+          "Failed to listen for transcription device changes:",
+          error,
+        );
+      });
+    return () => {
+      disposed = true;
+      refreshRef.current = () => {};
+      for (const subscription of [fallback, modelState]) {
+        void subscription.then((unlisten) => unlisten()).catch(console.error);
+      }
+    };
+  }, [t, currentAccelerator, currentGpuDevice]);
 
   const handleTranscribeChange = async (value: string) => {
     const { accelerator, gpuDevice } = decodeTranscribeValue(value);
@@ -106,15 +153,30 @@ export const AccelerationSelector: FC<AccelerationSelectorProps> = ({
       grouped={grouped}
       layout="horizontal"
     >
-      <Dropdown
-        options={transcribeOptions}
-        selectedValue={displayedTranscribe}
-        onSelect={handleTranscribeChange}
-        disabled={
-          isUpdating("transcribe_accelerator") ||
-          isUpdating("transcribe_gpu_device")
-        }
-      />
+      <div className="flex flex-col items-end gap-1">
+        <Dropdown
+          options={transcribeOptions}
+          selectedValue={currentTranscribe}
+          onSelect={handleTranscribeChange}
+          onOpen={() => refreshRef.current()}
+          disabled={
+            isUpdating("transcribe_accelerator") ||
+            isUpdating("transcribe_gpu_device")
+          }
+        />
+        {activeDevice?.is_fallback && (
+          <p
+            className="max-w-sm text-right text-xs text-amber-600 dark:text-amber-400"
+            aria-live="polite"
+          >
+            {t("settings.advanced.acceleration.currentlyUsingFallback", {
+              device: activeDevice.on_gpu
+                ? activeDevice.name
+                : t("errors.backupCpu"),
+            })}
+          </p>
+        )}
+      </div>
     </SettingContainer>
   );
 };
