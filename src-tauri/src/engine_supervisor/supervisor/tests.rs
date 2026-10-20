@@ -283,173 +283,55 @@ fn named_gpu(engine: &EngineSupervisor, name: &str) -> DeviceInfo {
         .unwrap_or_else(|| panic!("test requires {name}"))
 }
 
-fn expire_gpu_cooldown(engine: &EngineSupervisor) {
+fn expire_device_discovery(engine: &EngineSupervisor) {
     lock(&engine.shared.gpu_recheck).next = Some(Instant::now());
 }
 
+/// Driver faults leave a present GPU blacklisted across discovery scans.
+/// A real worker proves both fallback dictation and explicit retry still work.
 #[test]
 #[ignore]
-fn automatic_gpu_nvidia_to_amd_then_back_after_real_cooldown() {
+fn present_failed_gpu_stays_on_fallback_until_explicit_retry() {
     set_fault(None, false);
-    let notifications = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let count = notifications.clone();
-    let restored_events = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let restored_count = restored_events.clone();
-    let engine = EngineSupervisor::with_device_handlers(
-        true,
-        move |_| {
-            count.fetch_add(1, Ordering::SeqCst);
-        },
-        move |_| {
-            restored_count.fetch_add(1, Ordering::SeqCst);
-        },
-    );
+    let engine = EngineSupervisor::new(true);
     let nvidia = named_gpu(&engine, "NVIDIA");
-    let amd = named_gpu(&engine, "AMD");
     let preferred = LoadSpec {
         device: DeviceSelector::Key(nvidia.key.clone()),
         ..spec()
     };
-    set_fault(Some("abort@run"), false); // one crash, only in the isolated worker
+    set_fault(Some("abort@run"), false);
+    engine.load(preferred.clone()).unwrap();
+    assert!(!engine
+        .transcribe(test_pcm(), RunOptions::default())
+        .unwrap()
+        .text
+        .trim()
+        .is_empty());
+    let fallback = engine.loaded().unwrap();
+    assert_ne!(fallback.device_key.as_ref(), Some(&nvidia.key));
+    set_fault(None, false);
+    for _ in 0..3 {
+        expire_device_discovery(&engine);
+        assert!(engine.recheck_gpu().unwrap().is_none());
+        assert_eq!(engine.loaded().unwrap().device_key, fallback.device_key);
+        assert!(!engine
+            .transcribe(test_pcm(), RunOptions::default())
+            .unwrap()
+            .text
+            .trim()
+            .is_empty());
+    }
+    engine.retry_gpu("user explicitly retried the accelerator");
     assert_eq!(
-        engine.load(preferred.clone()).unwrap().device_key.as_ref(),
+        engine.load(preferred).unwrap().device_key.as_ref(),
         Some(&nvidia.key)
     );
-    let text = engine
-        .transcribe(test_pcm(), RunOptions::default())
-        .unwrap()
-        .text;
-    assert!(!text.trim().is_empty());
-    assert_eq!(engine.loaded().unwrap().device_key.as_ref(), Some(&amd.key));
-    assert!(engine.is_in_fallback());
-    assert_eq!(notifications.load(Ordering::SeqCst), 1);
-    assert!(!engine.gpu_recheck_due());
-    assert!(
-        engine.recheck_gpu().unwrap().is_none(),
-        "must not upgrade before cooldown"
-    );
-    set_fault(None, false);
-    println!("NVIDIA fault recovered on AMD; waiting for the real 30-second cooldown...");
-    thread::sleep(GPU_RECHECK_INITIAL + Duration::from_millis(100));
-    assert!(engine.gpu_recheck_due());
-    let restored = engine
-        .recheck_gpu()
-        .unwrap()
-        .expect("must restore preferred NVIDIA");
-    assert_eq!(restored.device_key.as_ref(), Some(&nvidia.key));
-    assert!(!engine.is_in_fallback());
-    assert!(!engine.gpu_recheck_due());
-    assert!(lock(&engine.shared.gpu_recheck).next.is_none());
-    assert_eq!(
-        lock(&engine.shared.gpu_recheck).delay,
-        Duration::from_secs(60)
-    );
-    assert_eq!(
-        restored_events.load(Ordering::SeqCst),
-        0,
-        "load alone must not notify"
-    );
-    assert!(!engine
-        .transcribe(test_pcm(), RunOptions::default())
-        .unwrap()
-        .text
-        .trim()
-        .is_empty());
-    assert_eq!(restored_events.load(Ordering::SeqCst), 1);
-    assert_eq!(lock(&engine.shared.gpu_recheck).delay, GPU_RECHECK_INITIAL);
-    engine
-        .transcribe(test_pcm(), RunOptions::default())
-        .unwrap();
-    assert_eq!(
-        restored_events.load(Ordering::SeqCst),
-        1,
-        "restoration only notifies once"
-    );
-    assert_eq!(
-        notifications.load(Ordering::SeqCst),
-        1,
-        "no extra notification for automatic retries"
-    );
-    assert_eq!(preferred.device, DeviceSelector::Key(nvidia.key));
-    println!("PASS: NVIDIA -> AMD -> NVIDIA, real cooldown, transcript and preference preserved");
     engine.unload().wait();
-    assert_eq!(worker_count(), 0);
 }
 
 #[test]
 #[ignore]
-fn automatic_gpu_cpu_survives_failed_rechecks_then_restores_amd() {
-    set_fault(None, false);
-    let notifications = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let count = notifications.clone();
-    let engine = EngineSupervisor::with_device_fallback_handler(true, move |_| {
-        count.fetch_add(1, Ordering::SeqCst);
-    });
-    let amd = named_gpu(&engine, "AMD");
-    let preferred = LoadSpec {
-        device: DeviceSelector::Key(amd.key.clone()),
-        ..spec()
-    };
-    set_fault(Some("abort@init"), true);
-    assert!(!engine.load(preferred.clone()).unwrap().on_gpu);
-    assert!(engine.is_in_fallback());
-    assert_eq!(notifications.load(Ordering::SeqCst), 1);
-    expire_gpu_cooldown(&engine);
-    assert!(
-        engine.recheck_gpu().unwrap().is_none(),
-        "failed probe must preserve CPU worker"
-    );
-    assert!(!engine.loaded().unwrap().on_gpu);
-    assert!(!engine
-        .transcribe(test_pcm(), RunOptions::default())
-        .unwrap()
-        .text
-        .trim()
-        .is_empty());
-    assert!(!engine.gpu_recheck_due());
-    // Devices enumerate, but still cannot load: fail both GPU loads and
-    // prove the next dictation still works on the CPU, without toast spam.
-    set_fault(Some("abort@load"), true);
-    expire_gpu_cooldown(&engine);
-    assert!(!engine.recheck_gpu().unwrap().unwrap().on_gpu);
-    assert!(!engine
-        .transcribe(test_pcm(), RunOptions::default())
-        .unwrap()
-        .text
-        .trim()
-        .is_empty());
-    assert_eq!(notifications.load(Ordering::SeqCst), 1);
-    set_fault(None, false);
-    expire_gpu_cooldown(&engine);
-    let restored = engine.recheck_gpu().unwrap().unwrap();
-    assert!(restored.on_gpu);
-    assert_eq!(restored.device_key.as_ref(), Some(&amd.key));
-    assert!(!engine.is_in_fallback());
-    assert!(!engine
-        .transcribe(test_pcm(), RunOptions::default())
-        .unwrap()
-        .text
-        .trim()
-        .is_empty());
-    // A queued check must not replace a model during active streaming.
-    let stream = engine
-        .start_stream(RunOptions::default(), StreamOptions::default(), |_| {})
-        .unwrap();
-    expire_gpu_cooldown(&engine);
-    assert!(engine.recheck_gpu().unwrap().is_none());
-    feed_paced(&stream, &test_pcm());
-    assert!(stream.finalize(false).unwrap().is_some());
-    assert_eq!(engine.loaded().unwrap().device_key.as_ref(), Some(&amd.key));
-    assert_eq!(notifications.load(Ordering::SeqCst), 1);
-    assert_eq!(preferred.device, DeviceSelector::Key(amd.key));
-    println!("PASS: CPU survives failed probe and failed GPU loads, restores AMD, streaming uninterrupted");
-    engine.unload().wait();
-    assert_eq!(worker_count(), 0);
-}
-
-#[test]
-#[ignore]
-fn automatic_gpu_restoration_notifies_only_after_stream_finalize() {
+fn observed_gpu_return_notifies_only_after_stream_finalize() {
     set_fault(None, false);
     let restored_events = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let count = restored_events.clone();
@@ -461,42 +343,53 @@ fn automatic_gpu_restoration_notifies_only_after_stream_finalize() {
         },
     );
     let gpu = named_gpu(&engine, "NVIDIA");
+    let devices = engine.devices().unwrap();
     let preferred = LoadSpec {
-        device: DeviceSelector::Key(gpu.key),
+        device: DeviceSelector::Key(gpu.key.clone()),
         ..spec()
     };
     engine
         .shared
-        .mark_gpu_unavailable("test previous backend failure");
-    assert!(!engine.load(preferred).unwrap().on_gpu);
-    expire_gpu_cooldown(&engine);
-    assert!(engine.recheck_gpu().unwrap().unwrap().on_gpu);
+        .mark_gpu_failed(&gpu.key, gpu.label(), "removed");
+    engine
+        .shared
+        .set_devices(devices.into_iter().filter(|d| d.key != gpu.key).collect());
+    // Load CPU directly so the returning device is first observed by discovery.
+    // Keep the original preference on the owner, as physical fallback does.
+    engine.shared.gpu_unavailable.store(true, Ordering::Release);
+    engine.load(preferred).unwrap();
+    engine
+        .shared
+        .gpu_unavailable
+        .store(false, Ordering::Release);
+    expire_device_discovery(&engine);
+    assert_eq!(
+        engine.recheck_gpu().unwrap().unwrap().device_key.as_ref(),
+        Some(&gpu.key)
+    );
     assert_eq!(restored_events.load(Ordering::SeqCst), 0);
     let stream = engine
         .start_stream(RunOptions::default(), StreamOptions::default(), |_| {})
         .unwrap();
     feed_paced(&stream, &test_pcm());
-    assert_eq!(
-        restored_events.load(Ordering::SeqCst),
-        0,
-        "live feeds do not confirm the completed dictation"
-    );
-    let result = stream.finalize(false).unwrap().unwrap();
-    assert!(!result.text.full.trim().is_empty());
+    assert_eq!(restored_events.load(Ordering::SeqCst), 0);
+    assert!(!stream
+        .finalize(false)
+        .unwrap()
+        .unwrap()
+        .text
+        .full
+        .trim()
+        .is_empty());
     assert_eq!(restored_events.load(Ordering::SeqCst), 1);
-    assert_eq!(lock(&engine.shared.gpu_recheck).delay, GPU_RECHECK_INITIAL);
     stream_all(&engine, &test_pcm()).unwrap();
-    assert_eq!(
-        restored_events.load(Ordering::SeqCst),
-        1,
-        "do not repeat the upgrade notification"
-    );
+    assert_eq!(restored_events.load(Ordering::SeqCst), 1);
     engine.unload().wait();
 }
 
 #[test]
 #[ignore]
-fn automatic_gpu_mixed_load_errors_restore_working_cpu() {
+fn optional_upgrade_load_errors_preserve_working_cpu() {
     set_fault(None, false);
     let engine = EngineSupervisor::new(true);
     let nvidia = named_gpu(&engine, "NVIDIA");
@@ -505,8 +398,11 @@ fn automatic_gpu_mixed_load_errors_restore_working_cpu() {
         device: DeviceSelector::Key(nvidia.key.clone()),
         ..spec()
     };
-    engine.shared.mark_gpu_unavailable("test previous failure");
-    assert!(!engine.load(preferred.clone()).unwrap().on_gpu);
+    engine
+        .shared
+        .mark_gpu_unavailable("test previous backend failure");
+    assert!(!engine.load(preferred).unwrap().on_gpu);
+    engine.retry_gpu("user retry");
     std::env::set_var(
         "HANDY_WORKER_LOAD_ERRORS",
         serde_json::to_string(&HashMap::from([
@@ -515,30 +411,22 @@ fn automatic_gpu_mixed_load_errors_restore_working_cpu() {
         ]))
         .unwrap(),
     );
-    expire_gpu_cooldown(&engine);
-    let restored = engine.recheck_gpu().unwrap().unwrap();
-    assert!(
-        !restored.on_gpu,
-        "upgrade must preserve a working CPU fallback"
-    );
-    assert!(
-        lock(&engine.shared.failed_gpus).contains_key(&amd.key),
-        "attribute the final error to AMD"
-    );
+    expire_device_discovery(&engine);
+    assert!(!engine.recheck_gpu().unwrap().unwrap().on_gpu);
+    assert!(lock(&engine.shared.failed_gpus).contains_key(&amd.key));
     assert!(!engine
         .transcribe(test_pcm(), RunOptions::default())
         .unwrap()
         .text
         .trim()
         .is_empty());
-    assert_eq!(preferred.device, DeviceSelector::Key(nvidia.key));
     set_fault(None, false);
     engine.unload().wait();
 }
 
 #[test]
 #[ignore]
-fn automatic_gpu_oom_restores_previous_gpu_then_cpu_if_needed() {
+fn returning_gpu_oom_restores_previous_gpu_then_cpu_if_needed() {
     set_fault(None, false);
     let engine = EngineSupervisor::new(true);
     let nvidia = named_gpu(&engine, "NVIDIA");
@@ -558,7 +446,9 @@ fn automatic_gpu_oom_restores_previous_gpu_then_cpu_if_needed() {
         "HANDY_WORKER_LOAD_ERRORS",
         serde_json::to_string(&HashMap::from([(nvidia.key.clone(), "allocation")])).unwrap(),
     );
-    expire_gpu_cooldown(&engine);
+    // Simulate a confirmed off/on transition before each fresh attempt.
+    engine.shared.set_devices(vec![amd.clone()]);
+    expire_device_discovery(&engine);
     assert_eq!(
         engine.recheck_gpu().unwrap().unwrap().device_key.as_ref(),
         Some(&amd.key)
@@ -572,12 +462,14 @@ fn automatic_gpu_oom_restores_previous_gpu_then_cpu_if_needed() {
     std::env::set_var(
         "HANDY_WORKER_LOAD_ERRORS",
         serde_json::to_string(&HashMap::from([
-            (nvidia.key, "allocation"),
-            (amd.key, "allocation"),
+            (nvidia.key.clone(), "allocation"),
+            (amd.key.clone(), "allocation"),
         ]))
         .unwrap(),
     );
-    expire_gpu_cooldown(&engine);
+    // Simulate a confirmed off/on transition before each fresh attempt.
+    engine.shared.set_devices(vec![amd.clone()]);
+    expire_device_discovery(&engine);
     assert!(
         !engine.recheck_gpu().unwrap().unwrap().on_gpu,
         "failed GPU restoration must still try CPU"
@@ -594,7 +486,7 @@ fn automatic_gpu_oom_restores_previous_gpu_then_cpu_if_needed() {
 
 #[test]
 #[ignore]
-fn automatic_gpu_retry_survives_idle_model_unload() {
+fn idle_model_unload_does_not_release_a_failed_present_gpu() {
     set_fault(None, false);
     let engine = EngineSupervisor::new(true);
     let nvidia = named_gpu(&engine, "NVIDIA");
@@ -604,27 +496,28 @@ fn automatic_gpu_retry_survives_idle_model_unload() {
     };
     engine
         .shared
-        .mark_gpu_unavailable("test a previous backend failure");
-    assert!(!engine.load(preferred.clone()).unwrap().on_gpu);
-    expire_gpu_cooldown(&engine);
+        .mark_gpu_failed(&nvidia.key, nvidia.label(), "driver fault");
+    assert_ne!(
+        engine.load(preferred.clone()).unwrap().device_key.as_ref(),
+        Some(&nvidia.key)
+    );
+    expire_device_discovery(&engine);
     engine.unload().wait();
-    let restored = engine.load(preferred.clone()).unwrap();
-    assert_eq!(restored.device_key.as_ref(), Some(&nvidia.key));
-    assert!(!engine.is_in_fallback());
+    assert_ne!(
+        engine.load(preferred).unwrap().device_key.as_ref(),
+        Some(&nvidia.key)
+    );
     assert!(!engine
         .transcribe(test_pcm(), RunOptions::default())
         .unwrap()
         .text
         .trim()
         .is_empty());
-    assert_eq!(preferred.device, DeviceSelector::Key(nvidia.key));
-    println!("PASS: idle unload preserves a due automatic GPU retry");
     engine.unload().wait();
-    assert_eq!(worker_count(), 0);
 }
 
 /// A GPU-only crash retries the dictation on another healthy device.
-/// Failed GPUs stay excluded until an explicit retry or cooldown recheck.
+/// Failed GPUs stay excluded until an explicit retry or an observed removal and return.
 #[test]
 #[ignore]
 fn gpu_only_crash_recovers_on_another_device() {

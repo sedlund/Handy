@@ -19,17 +19,16 @@
 //! all: a driver that crashes or hangs while initializing can't take the CPU
 //! fallback down with it.
 //!
-//! A failed GPU is temporarily excluded; recovery tries another healthy GPU
-//! before strict CPU without changing the saved preference. Failed devices
-//! are retried after a cooldown. Healthy Auto separately discovers GPUs that
-//! appear later, even when its current device has never failed. Both checks
-//! run between dictations when due, so idle Handy does no hardware polling
-//! and active live streams keep their decoder. Recovery handles driver faults;
-//! it cannot repair the underlying driver.
+//! A failed GPU is excluded while recovery tries another healthy GPU before
+//! strict CPU, without changing the saved preference. Discovery can select a
+//! new GPU or a failed one observed disappearing and then returning. A failed
+//! device that stays present is never retried automatically; restart Handy or
+//! explicitly change accelerators to try it again. Checks run between dictations
+//! at most once a minute, so idle Handy does no hardware polling and active
+//! streams keep their decoder. Recovery cannot repair the underlying driver.
 //!
-//! An explicit GPU preference is retried after failures, while an explicit CPU
-//! preference or host GPU restriction prevents GPU upgrades. CLI device indices
-//! are strict diagnostic selections: their errors do not trigger fallback.
+//! Explicit CPU preferences and host GPU restrictions prevent GPU upgrades.
+//! CLI device indices are strict diagnostic selections without fallback.
 //!
 //! - `protocol`: the framed request/response protocol between the two.
 //! - `supervisor`: the parent side ([`EngineSupervisor`]).

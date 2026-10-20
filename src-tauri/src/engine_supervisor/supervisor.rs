@@ -20,7 +20,7 @@ use super::protocol::{
 use super::worker::LOG_LINE_PREFIX;
 use super::{CPU_ONLY_FLAG, LOG_LEVEL_ENV, WORKER_FLAG};
 use log::{debug, error, info, warn, Level};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::io::{self, BufRead, BufReader, Write};
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -48,59 +48,25 @@ const STDERR_TAIL_LINES: usize = 64;
 const SAMPLE_RATE: f64 = 16_000.0;
 /// Bound retries even if devices repeatedly appear during recovery.
 const MAX_GPU_RECOVERY_ATTEMPTS: usize = 8;
-const GPU_RECHECK_INITIAL: Duration = Duration::from_secs(30);
-const GPU_RECHECK_MAX: Duration = Duration::from_secs(300);
-/// Auto can start successfully before a more capable GPU becomes visible.
+/// Discover devices only at dictation boundaries. This supports a dedicated
+/// GPU powered off at startup, or removed and later reconnected. Visibility
+/// alone never retries a failed device: it must first disappear and return,
+/// or the user must explicitly change accelerators or restart Handy.
 const AUTO_DEVICE_RECHECK_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Only consulted when a dictation starts; no background hardware polling.
-/// Healthy Auto needs discovery even without a previous failure: a dedicated
-/// GPU may be powered off at startup or appear after a driver restart.
-/// Failure retries use exponential backoff from GPU_RECHECK_INITIAL to
-/// GPU_RECHECK_MAX, taking precedence over discovery to avoid repeatedly
-/// probing an unstable driver. Successful model loading alone is not enough
-/// to reset that backoff; inference must succeed on the normal device.
+#[derive(Default)]
 struct GpuRecheck {
-    /// Discovery is independent of inference success and failure backoff.
-    discovery_next: Option<Instant>,
     next: Option<Instant>,
-    delay: Duration,
-}
-
-impl Default for GpuRecheck {
-    fn default() -> Self {
-        Self {
-            discovery_next: None,
-            next: None,
-            delay: GPU_RECHECK_INITIAL,
-        }
-    }
 }
 
 impl GpuRecheck {
     fn due(&self) -> bool {
-        // Failure cooldown takes precedence over routine Auto discovery.
-        self.next
-            .or(self.discovery_next)
-            .is_some_and(|next| Instant::now() >= next)
+        self.next.is_some_and(|next| Instant::now() >= next)
     }
 
     fn schedule(&mut self) {
-        if self.next.is_none() {
-            self.next = Some(Instant::now() + self.delay);
-        }
-    }
-
-    fn back_off(&mut self) {
-        self.delay = (self.delay * 2).min(GPU_RECHECK_MAX);
-        self.next = Some(Instant::now() + self.delay);
-    }
-
-    /// A different GPU may fail after an older fallback cooldown expired.
-    /// Give this failure a full cooldown too; don't immediately retry it.
-    fn after_failure(&mut self) {
-        let next = Instant::now() + self.delay;
-        self.next = Some(self.next.map_or(next, |previous| previous.max(next)));
+        self.next
+            .get_or_insert_with(|| Instant::now() + AUTO_DEVICE_RECHECK_INTERVAL);
     }
 }
 
@@ -275,11 +241,14 @@ struct Shared {
     gpu_allowed: bool,
     /// A GPU-backend failure could not be attributed to one device (e.g.
     /// backend initialization crashed). Models then load in CPU-only workers
-    /// until an explicit retry or a cooldown recovery attempt; known devices
+    /// until an explicit accelerator change or restart; known devices
     /// fail independently.
     gpu_unavailable: AtomicBool,
     /// Quarantine individual GPU identities while other GPUs remain usable.
     failed_gpus: Mutex<HashMap<String, String>>,
+    /// A failed device can return automatically only after a successful
+    /// enumeration observed it missing. Failed probes never count as removal.
+    missing_failed_gpus: Mutex<HashSet<String>>,
     gpu_recheck: Mutex<GpuRecheck>,
     fallback_active: AtomicBool,
     /// Report each recovery once, after a replacement model has loaded.
@@ -360,6 +329,20 @@ impl Shared {
                 );
             }
         }
+        // Keep a present-but-failing driver blacklisted. A real availability
+        // transition (e.g. a gaming laptop powering its dedicated GPU off/on)
+        // is the only automatic way to release an individual device.
+        let mut failed = lock(&self.failed_gpus);
+        let mut missing = lock(&self.missing_failed_gpus);
+        failed.retain(|key, name| {
+            if device_missing(key, Some(&new)) {
+                missing.insert(key.clone());
+            } else if missing.remove(key) {
+                info!("Transcription GPU '{}' became available again", name);
+                return false;
+            }
+            true
+        });
         *current = Some(new);
     }
 
@@ -370,7 +353,6 @@ impl Shared {
     /// `reason` is logged when this changes the state.
     fn mark_gpu_unavailable(&self, reason: impl fmt::Display) {
         if !self.gpu_unavailable.swap(true, Ordering::AcqRel) {
-            lock(&self.gpu_recheck).after_failure();
             self.gpu_fallback_pending.store(true, Ordering::Release);
             warn!("Transcription GPU marked unavailable: {}", reason);
         }
@@ -385,7 +367,11 @@ impl Shared {
             .insert(key.to_string(), name.to_string())
             .is_none();
         if fresh {
-            lock(&self.gpu_recheck).after_failure();
+            // Allocation-error recovery may already have confirmed removal
+            // before this failure was attributed to its bound device.
+            if device_missing(key, lock(&self.devices).as_deref()) {
+                lock(&self.missing_failed_gpus).insert(key.to_string());
+            }
             self.gpu_fallback_pending.store(true, Ordering::Release);
             warn!(
                 "Transcription GPU '{}' marked unavailable: {}",
@@ -396,12 +382,14 @@ impl Shared {
     }
 
     fn recovery_spec(&self, spec: &LoadSpec) -> LoadSpec {
+        // Match set_devices' lock order: registry before failure state.
+        let devices = lock(&self.devices);
         let failed = lock(&self.failed_gpus);
         select_recovery_spec(
             spec,
             self.gpu_unavailable(),
             &failed,
-            lock(&self.devices).as_deref().unwrap_or_default(),
+            devices.as_deref().unwrap_or_default(),
         )
     }
 
@@ -558,6 +546,7 @@ impl EngineSupervisor {
             .store(false, Ordering::Release);
         let had_device_failures = !lock(&self.shared.failed_gpus).is_empty();
         lock(&self.shared.failed_gpus).clear();
+        lock(&self.shared.missing_failed_gpus).clear();
         *lock(&self.shared.gpu_recheck) = GpuRecheck::default();
         if self.shared.gpu_unavailable.swap(false, Ordering::AcqRel) || had_device_failures {
             info!("Transcription GPU no longer marked unavailable: {}", reason);
@@ -1080,8 +1069,8 @@ impl Owner {
     }
 
     /// Compare the bound device with the original request, preserving the
-    /// saved preference while a temporary replacement is used. Only healthy
-    /// Auto needs routine discovery; an explicit GPU only needs failure retries.
+    /// saved preference while a temporary replacement is used. Auto and
+    /// fallbacks discover newly available devices, without retrying failures.
     fn update_gpu_recheck(&self, spec: &LoadSpec, info: &LoadedInfo) {
         let fallback = self.shared.gpu_allowed
             && !spec.cpu_only()
@@ -1090,33 +1079,30 @@ impl Owner {
                 DeviceSelector::Key(key) | DeviceSelector::RecoveryKey(key) => {
                     !info.on_gpu || info.device_key.as_ref() != Some(key)
                 }
-                _ => !info.on_gpu || self.shared.has_gpu_failures(),
+                // Auto accepts any healthy GPU. A different device's blacklist
+                // must not keep this binding in fallback or suppress upgrades.
+                _ => !info.on_gpu,
             };
         let was_fallback = self.shared.fallback_active.swap(fallback, Ordering::AcqRel);
         let mut recheck = lock(&self.shared.gpu_recheck);
+        if self.shared.gpu_allowed
+            && !spec.cpu_only()
+            && !spec.pinned()
+            && !self.shared.gpu_unavailable()
+            && (fallback || matches!(spec.device, DeviceSelector::Auto))
+        {
+            recheck.schedule();
+        } else {
+            recheck.next = None;
+        }
         if fallback {
-            recheck.discovery_next = None;
             self.shared
                 .device_restore_pending
                 .store(false, Ordering::Release);
             self.shared
                 .device_upgrade_pending
                 .store(false, Ordering::Release);
-            recheck.schedule();
         } else {
-            // Loading does not prove inference is healthy. Preserve failure
-            // delay, while healthy Auto still discovers devices added later.
-            recheck.next = None;
-            if self.shared.gpu_allowed
-                && !spec.cpu_only()
-                && matches!(spec.device, DeviceSelector::Auto)
-            {
-                recheck
-                    .discovery_next
-                    .get_or_insert_with(|| Instant::now() + AUTO_DEVICE_RECHECK_INTERVAL);
-            } else {
-                recheck.discovery_next = None;
-            }
             if was_fallback && info.on_gpu && !spec.cpu_only() && !spec.pinned() {
                 self.shared
                     .device_restore_pending
@@ -1125,9 +1111,8 @@ impl Owner {
         }
     }
 
-    /// Called after successful, nonempty batch inference or stream finalize.
-    /// Confirm recovery or an Auto upgrade once, and reset failure backoff only
-    /// now: a GPU can load a model successfully but crash on its first inference.
+    /// Confirm recovery or an Auto upgrade after nonempty inference, rather
+    /// than model loading. Success does not clear other devices' blacklists.
     fn confirm_device_success(&self) {
         if self.shared.fallback_active.load(Ordering::Acquire) {
             return;
@@ -1140,13 +1125,6 @@ impl Owner {
         else {
             return;
         };
-        {
-            let mut recheck = lock(&self.shared.gpu_recheck);
-            recheck.delay = GPU_RECHECK_INITIAL;
-            recheck.next = None;
-            // Successful dictations must not postpone Auto discovery forever.
-            // Its deadline advances only when a scan is actually attempted.
-        }
         if self
             .shared
             .device_restore_pending
@@ -1227,9 +1205,9 @@ impl Owner {
         }
     }
 
-    /// Probe in an isolated, model-less worker when discovery or recovery is due. A
-    /// successful enumeration alone never clears a device's failure state:
-    /// it must also load the model. Fresh enumeration resolves stable device
+    /// Probe when discovery is due. A still-present failed device is excluded;
+    /// set_devices releases it only after observed removal and return. Fresh
+    /// enumeration resolves stable device
     /// identities again because driver restarts can change registry indices.
     /// Backend initialization can be slow or hang, so the model-less probe is
     /// isolated with the usual timeout and cancellation protections. The existing
@@ -1242,21 +1220,16 @@ impl Owner {
         let Some(spec) = self.spec.clone() else {
             return Ok(None);
         };
-        if !self.shared.gpu_allowed || spec.cpu_only() || spec.pinned() {
+        if !self.shared.gpu_allowed
+            || self.shared.gpu_unavailable()
+            || spec.cpu_only()
+            || spec.pinned()
+        {
             *lock(&self.shared.gpu_recheck) = GpuRecheck::default();
             return Ok(None);
         }
-        // Reserve this attempt before touching the driver, including failures.
-        // Routine discovery stays at 60 seconds; failed-device retries retain
-        // their independent, increasing cooldown.
-        {
-            let mut recheck = lock(&self.shared.gpu_recheck);
-            if recheck.next.is_some() {
-                recheck.back_off();
-            } else {
-                recheck.discovery_next = Some(Instant::now() + AUTO_DEVICE_RECHECK_INTERVAL);
-            }
-        }
+        // Reserve discovery before touching the driver, even if probing fails.
+        lock(&self.shared.gpu_recheck).next = Some(Instant::now() + AUTO_DEVICE_RECHECK_INTERVAL);
         let epoch = self.shared.epoch();
         let probe = (|| {
             let _probing = lock(&self.shared.probing);
@@ -1284,7 +1257,15 @@ impl Owner {
         };
         self.shared.set_devices(devices.clone());
         let current = self.worker.as_ref().and_then(|worker| worker.info.as_ref());
-        let Some(candidate) = upgrade_candidate(&spec, current, &devices) else {
+        let eligible: Vec<_> = {
+            let failed = lock(&self.shared.failed_gpus);
+            devices
+                .iter()
+                .filter(|device| !failed.contains_key(&device.key))
+                .cloned()
+                .collect()
+        };
+        let Some(candidate) = upgrade_candidate(&spec, current, &eligible) else {
             return Ok(None);
         };
         let auto_upgrade = matches!(spec.device, DeviceSelector::Auto)
@@ -1296,17 +1277,11 @@ impl Owner {
         let previous = current.cloned();
         let key = candidate.key.clone();
         let name = candidate.label().to_string();
-        info!("Automatically retrying transcription GPU '{}'", name);
-        // Backend initialization is retried only by this isolated attempt.
-        self.shared.gpu_unavailable.store(false, Ordering::Release);
-        // All visible GPUs may have recovered (e.g. both drivers restarted).
-        // Try the preferred one first, then allow the others before CPU.
-        lock(&self.shared.failed_gpus).retain(|failed, _| {
-            !devices
-                .iter()
-                .any(|device| device.is_gpu() && &device.key == failed)
-        });
-        // No repeated user notification when a periodic retry fails.
+        info!(
+            "Automatically selecting available transcription GPU '{}'",
+            name
+        );
+        // Avoid duplicate failure notifications during an optional upgrade.
         self.shared
             .gpu_fallback_pending
             .store(false, Ordering::Release);
