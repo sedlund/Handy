@@ -39,55 +39,61 @@ fn policy_owner() -> Owner {
 }
 
 #[test]
-fn gpu_cooldown_starts_at_thirty_seconds_and_caps_at_five_minutes() {
+fn discovery_is_throttled_without_postponing_the_next_scan() {
     let mut recheck = GpuRecheck::default();
-    assert!(!recheck.due());
     let before = Instant::now();
     recheck.schedule();
     let first = recheck.next.unwrap();
-    assert!(first >= before + GPU_RECHECK_INITIAL);
+    assert!(first >= before + AUTO_DEVICE_RECHECK_INTERVAL);
     assert!(!recheck.due());
     recheck.schedule();
-    assert_eq!(
-        recheck.next,
-        Some(first),
-        "dictations must not postpone a check"
-    );
+    assert_eq!(recheck.next, Some(first));
     recheck.next = Some(Instant::now());
     assert!(recheck.due());
-    for seconds in [60, 120, 240, 300, 300] {
-        recheck.back_off();
-        assert_eq!(recheck.delay, Duration::from_secs(seconds));
-        assert!(!recheck.due());
-    }
 }
 
 #[test]
-fn a_new_gpu_failure_gets_a_full_cooldown_after_an_older_one_expired() {
+fn repeated_enumeration_keeps_present_failed_gpu_blacklisted() {
     let shared = Shared::default();
-    shared.mark_gpu_failed("nvidia", "NVIDIA", "removed");
-    lock(&shared.gpu_recheck).next = Some(Instant::now() - Duration::from_secs(1));
-    let before = Instant::now();
-    shared.mark_gpu_failed("amd", "AMD", "driver restarted");
-    let recheck = lock(&shared.gpu_recheck);
-    assert!(!recheck.due());
-    assert!(recheck.next.unwrap() >= before + GPU_RECHECK_INITIAL);
+    let devices = vec![gpu("failed", 12), gpu("healthy", 6)];
+    shared.set_devices(devices.clone());
+    shared.mark_gpu_failed("failed", "Failed GPU", "device lost");
+    for _ in 0..5 {
+        shared.set_devices(devices.clone());
+        assert_eq!(
+            shared.recovery_spec(&auto_spec()).device,
+            DeviceSelector::RecoveryKey("healthy".into())
+        );
+    }
+    assert!(lock(&shared.missing_failed_gpus).is_empty());
 }
 
 #[test]
-fn another_failure_keeps_the_longer_backoff_and_does_not_shorten_it() {
+fn only_observed_removal_and_return_releases_a_failed_device() {
     let shared = Shared::default();
-    {
-        let mut recheck = lock(&shared.gpu_recheck);
-        recheck.back_off();
-        recheck.next = Some(Instant::now() - Duration::from_secs(1));
-    }
-    let before = Instant::now();
-    shared.mark_gpu_unavailable("backend crashed after retry");
-    let next = lock(&shared.gpu_recheck).next.unwrap();
-    assert!(next >= before + Duration::from_secs(60));
-    shared.mark_gpu_unavailable("duplicate failure report");
-    assert_eq!(lock(&shared.gpu_recheck).next, Some(next));
+    let devices = vec![gpu("returning", 12), gpu("unstable", 6)];
+    shared.set_devices(devices.clone());
+    shared.mark_gpu_failed("returning", "Returning GPU", "removed");
+    shared.mark_gpu_failed("unstable", "Unstable GPU", "driver fault");
+    shared.set_devices(vec![devices[1].clone()]);
+    assert!(lock(&shared.failed_gpus).contains_key("returning"));
+    shared.set_devices(devices);
+    assert!(!lock(&shared.failed_gpus).contains_key("returning"));
+    assert!(lock(&shared.failed_gpus).contains_key("unstable"));
+    assert_eq!(
+        shared.recovery_spec(&auto_spec()).device,
+        DeviceSelector::RecoveryKey("returning".into())
+    );
+}
+
+#[test]
+fn removal_confirmed_before_failure_attribution_still_allows_return() {
+    let shared = Shared::default();
+    shared.set_devices(vec![gpu("healthy", 6)]);
+    shared.mark_gpu_failed("removed", "Removed GPU", "allocation on a removed GPU");
+    shared.set_devices(vec![gpu("removed", 12), gpu("healthy", 6)]);
+    assert!(!lock(&shared.failed_gpus).contains_key("removed"));
+    assert!(lock(&shared.missing_failed_gpus).is_empty());
 }
 
 #[test]
@@ -164,7 +170,7 @@ fn automatic_upgrade_prefers_saved_gpu_and_never_reloads_the_active_gpu() {
 }
 
 #[test]
-fn fallback_status_and_cooldown_clear_when_preferred_device_returns() {
+fn fallback_status_and_discovery_clear_when_preferred_device_returns() {
     let owner = policy_owner();
     let preferred = LoadSpec {
         device: DeviceSelector::Key("nvidia".into()),
@@ -183,29 +189,30 @@ fn fallback_status_and_cooldown_clear_when_preferred_device_returns() {
 }
 
 #[test]
-fn loading_a_recovered_gpu_preserves_backoff_until_inference_succeeds() {
+fn backend_initialization_failure_requires_an_explicit_retry() {
     let owner = policy_owner();
-    let preferred = LoadSpec {
-        device: DeviceSelector::Key("preferred".into()),
-        ..auto_spec()
-    };
-    owner.update_gpu_recheck(&preferred, &loaded(None));
-    lock(&owner.shared.gpu_recheck).back_off();
-    owner.update_gpu_recheck(&preferred, &loaded(Some("preferred")));
-    assert!(!owner.shared.fallback_active.load(Ordering::Acquire));
-    assert!(owner.shared.device_restore_pending.load(Ordering::Acquire));
-    assert!(lock(&owner.shared.gpu_recheck).next.is_none());
-    assert_eq!(
-        lock(&owner.shared.gpu_recheck).delay,
-        Duration::from_secs(60)
-    );
-    let before = Instant::now();
     owner
         .shared
-        .mark_gpu_failed("preferred", "Preferred", "first inference failed");
-    owner.update_gpu_recheck(&preferred, &loaded(None));
-    assert!(!owner.shared.device_restore_pending.load(Ordering::Acquire));
-    assert!(lock(&owner.shared.gpu_recheck).next.unwrap() >= before + Duration::from_secs(60));
+        .mark_gpu_unavailable("backend initialization crashed");
+    owner.update_gpu_recheck(&auto_spec(), &loaded(None));
+    assert!(!lock(&owner.shared.gpu_recheck).due());
+    assert!(lock(&owner.shared.gpu_recheck).next.is_none());
+    assert!(owner.shared.recovery_spec(&auto_spec()).cpu_only());
+}
+
+#[test]
+fn healthy_auto_gpu_clears_fallback_without_releasing_failed_devices() {
+    let owner = policy_owner();
+    owner
+        .shared
+        .mark_gpu_failed("unstable", "Unstable GPU", "driver fault");
+    owner.update_gpu_recheck(&auto_spec(), &loaded(None));
+    assert!(owner.shared.fallback_active.load(Ordering::Acquire));
+    owner.update_gpu_recheck(&auto_spec(), &loaded(Some("healthy")));
+    assert!(!owner.shared.fallback_active.load(Ordering::Acquire));
+    assert!(owner.shared.device_restore_pending.load(Ordering::Acquire));
+    assert!(lock(&owner.shared.failed_gpus).contains_key("unstable"));
+    assert!(lock(&owner.shared.gpu_recheck).next.is_some());
 }
 
 #[test]
