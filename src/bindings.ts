@@ -1045,7 +1045,7 @@ long_form_chunking?: boolean;
 overlay_style?: OverlayStyle }
 export type AudioDevice = { index: string; name: string; is_default: boolean }
 export type AutoSubmitKey = "enter" | "ctrl_enter" | "cmd_enter"
-export type ActiveTranscriptionDevice = { name: string; on_gpu: boolean; is_fallback: boolean }
+export type ActiveTranscriptionDevice = { name: string; on_gpu: boolean; is_fallback: boolean; is_pending: boolean }
 export type AvailableAccelerators = { transcribe: string[]; gpu_devices: GpuDeviceOption[]; active_device: ActiveTranscriptionDevice | null }
 export type BindingResponse = { success: boolean; binding: ShortcutBinding | null; error: string | null }
 /**
@@ -1219,7 +1219,7 @@ export type StreamTextEvent = { committed: string; tentative: string }
 /**
  * Semantic kind of "working" phase, used to localize the spinner label.
  */
-export type StreamWorkKind = "transcribing" | "polishing"
+export type StreamWorkKind = "transcribing" | "polishing" | "recovering"
 /**
  * UI appearance mode. `System` follows the OS `prefers-color-scheme`; `Light`
  * and `Dark` force one of the two palettes Handy already ships.

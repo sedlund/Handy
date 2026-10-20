@@ -118,7 +118,24 @@ test("fallback status is amber, preserves preference, and disappears on recovery
   await expect(status).toContainText("your computer's CPU (fallback)");
   await expect(selected).toBeVisible();
 
-  await updateDevice("NVIDIA test GPU", true, false, "model-state-changed");
+  // A retry can bind AMD, then fail again before successful inference. Status
+  // must follow both bindings even though no restored/upgrade toast was sent.
+  await updateDevice(
+    "AMD test GPU",
+    true,
+    true,
+    "transcription-device-changed",
+  );
+  await expect(status).toContainText("AMD test GPU (fallback)");
+  await updateDevice("CPU", false, true, "transcription-device-changed");
+  await expect(status).toContainText("your computer's CPU (fallback)");
+
+  await updateDevice(
+    "NVIDIA test GPU",
+    true,
+    false,
+    "transcription-device-restored",
+  );
   await expect(status).toHaveCount(0);
   await expect(selected).toBeVisible();
   const writes = await page.evaluate(

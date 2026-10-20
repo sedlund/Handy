@@ -85,6 +85,7 @@ pub enum StreamPhase {
 pub enum StreamWorkKind {
     Transcribing,
     Polishing,
+    Recovering,
 }
 
 /// Emitted to switch the streaming overlay to a working spinner.
@@ -274,8 +275,10 @@ impl TranscriptionManager {
     pub fn new(app_handle: &AppHandle, model_manager: Arc<ModelManager>) -> Result<Self> {
         let fallback_app = app_handle.clone();
         let restored_app = app_handle.clone();
+        let upgraded_app = app_handle.clone();
+        let changed_app = app_handle.clone();
         let manager = Self {
-            engine: EngineSupervisor::with_device_handlers(
+            engine: EngineSupervisor::with_device_status_handlers(
                 !transcribe_gpu_disabled_for_host(),
                 move |info| {
                     let _ = fallback_app.emit(
@@ -292,6 +295,22 @@ impl TranscriptionManager {
                 move |info| {
                     let _ = restored_app.emit(
                         "transcription-device-restored",
+                        TranscriptionDeviceEvent {
+                            device_name: info.device.clone(),
+                        },
+                    );
+                },
+                move |info| {
+                    let _ = upgraded_app.emit(
+                        "transcription-device-upgraded",
+                        TranscriptionDeviceEvent {
+                            device_name: info.device.clone(),
+                        },
+                    );
+                },
+                move |info| {
+                    let _ = changed_app.emit(
+                        "transcription-device-changed",
                         TranscriptionDeviceEvent {
                             device_name: info.device.clone(),
                         },
@@ -1888,6 +1907,7 @@ pub struct ActiveTranscriptionDevice {
     pub name: String,
     pub on_gpu: bool,
     pub is_fallback: bool,
+    pub is_pending: bool,
 }
 
 #[derive(Serialize, Clone, Debug, Type)]
@@ -1920,16 +1940,60 @@ pub fn get_available_accelerators(tm: &TranscriptionManager) -> AvailableAcceler
                 .transcribe_gpu_device
                 .as_deref()
                 .is_some_and(|key| info.device_key.as_deref() != Some(key));
+        // A manual setting change is applied on the next model use. The old
+        // binding is still healthy; a mismatch here is not a device failure.
+        let reload_pending = tm.reload_model_on_next_use.load(Ordering::Acquire);
+        let selection_mismatch = preferred_missing
+            || (settings.transcribe_accelerator == TranscribeAcceleratorSetting::Cpu
+                && info.on_gpu);
         ActiveTranscriptionDevice {
             name: info.device,
             on_gpu: info.on_gpu,
-            is_fallback: tm.engine.is_in_fallback() || preferred_missing,
+            is_fallback: !reload_pending && (tm.engine.is_in_fallback() || preferred_missing),
+            is_pending: reload_pending && selection_mismatch,
         }
     });
     AvailableAccelerators {
         transcribe: transcribe_options,
         gpu_devices,
         active_device,
+    }
+}
+
+impl Drop for TranscriptionManager {
+    fn drop(&mut self) {
+        // Skip shutdown unless this is the very last clone. TranscriptionManager
+        // is cloned by initiate_model_load() and the watcher thread — those
+        // clones dropping must not kill the watcher. The watcher thread holds
+        // its own clone, so current_model_id's strong_count is always >= 2 while
+        // the watcher is alive. (current_model_id is only ever cloned along with
+        // the manager; shutdown_signal is not, since the watcher also holds a
+        // standalone clone of it.) When it reaches 1, only this instance
+        // remains and we can safely shut down.
+        if Arc::strong_count(&self.current_model_id) > 1 {
+            return;
+        }
+
+        // Signal the watcher thread to shutdown
+        self.shutdown_signal.store(true, Ordering::Relaxed);
+
+        // Wait for the thread to finish gracefully.
+        // Use match instead of unwrap to avoid panicking if the mutex is
+        // poisoned — a panic inside Drop calls abort().
+        let mut guard = match self.watcher_handle.lock() {
+            Ok(g) => g,
+            Err(e) => {
+                warn!("Recovered poisoned watcher_handle mutex during TranscriptionManager drop — a panic occurred earlier this session");
+                e.into_inner()
+            }
+        };
+        if let Some(handle) = guard.take() {
+            if let Err(e) = handle.join() {
+                warn!("Failed to join idle watcher thread: {:?}", e);
+            } else {
+                debug!("Idle watcher thread joined successfully");
+            }
+        }
     }
 }
 
@@ -2448,42 +2512,5 @@ mod tests {
             &supported,
         );
         assert_eq!(corrected, "i use Handy every day");
-    }
-}
-
-impl Drop for TranscriptionManager {
-    fn drop(&mut self) {
-        // Skip shutdown unless this is the very last clone. TranscriptionManager
-        // is cloned by initiate_model_load() and the watcher thread — those
-        // clones dropping must not kill the watcher. The watcher thread holds
-        // its own clone, so current_model_id's strong_count is always >= 2 while
-        // the watcher is alive. (current_model_id is only ever cloned along with
-        // the manager; shutdown_signal is not, since the watcher also holds a
-        // standalone clone of it.) When it reaches 1, only this instance
-        // remains and we can safely shut down.
-        if Arc::strong_count(&self.current_model_id) > 1 {
-            return;
-        }
-
-        // Signal the watcher thread to shutdown
-        self.shutdown_signal.store(true, Ordering::Relaxed);
-
-        // Wait for the thread to finish gracefully.
-        // Use match instead of unwrap to avoid panicking if the mutex is
-        // poisoned — a panic inside Drop calls abort().
-        let mut guard = match self.watcher_handle.lock() {
-            Ok(g) => g,
-            Err(e) => {
-                warn!("Recovered poisoned watcher_handle mutex during TranscriptionManager drop — a panic occurred earlier this session");
-                e.into_inner()
-            }
-        };
-        if let Some(handle) = guard.take() {
-            if let Err(e) = handle.join() {
-                warn!("Failed to join idle watcher thread: {:?}", e);
-            } else {
-                debug!("Idle watcher thread joined successfully");
-            }
-        }
     }
 }

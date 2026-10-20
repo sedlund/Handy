@@ -213,24 +213,32 @@ function App() {
 
   // Device changes may happen while Settings is hidden.
   useEffect(() => {
-    const notify = async (deviceName: string, restored: boolean) => {
+    const notify = async (
+      deviceName: string,
+      kind: "fallback" | "restored" | "upgraded",
+    ) => {
       const device = deviceName === "cpu" ? t("errors.backupCpu") : deviceName;
+      const notificationKeys = {
+        fallback: {
+          title: "errors.deviceFallbackTitle",
+          description: "errors.deviceFallbackDescription",
+        },
+        restored: {
+          title: "errors.deviceRestoredTitle",
+          description: "errors.deviceRestoredDescription",
+        },
+        upgraded: {
+          title: "errors.deviceUpgradedTitle",
+          description: "errors.deviceUpgradedDescription",
+        },
+      } as const;
       try {
         let granted = await isPermissionGranted();
         if (!granted) granted = (await requestPermission()) === "granted";
         if (granted) {
           await sendNotification({
-            title: t(
-              restored
-                ? "errors.deviceRestoredTitle"
-                : "errors.deviceFallbackTitle",
-            ),
-            body: t(
-              restored
-                ? "errors.deviceRestoredDescription"
-                : "errors.deviceFallbackDescription",
-              { device },
-            ),
+            title: t(notificationKeys[kind].title),
+            body: t(notificationKeys[kind].description, { device }),
           });
         }
       } catch (error) {
@@ -244,13 +252,19 @@ function App() {
       listen<TranscriptionDeviceEvent>(
         "transcription-device-fallback",
         (event) => {
-          void notify(event.payload.device_name, false);
+          void notify(event.payload.device_name, "fallback");
         },
       ),
       listen<TranscriptionDeviceEvent>(
         "transcription-device-restored",
         (event) => {
-          void notify(event.payload.device_name, true);
+          void notify(event.payload.device_name, "restored");
+        },
+      ),
+      listen<TranscriptionDeviceEvent>(
+        "transcription-device-upgraded",
+        (event) => {
+          void notify(event.payload.device_name, "upgraded");
         },
       ),
     ];

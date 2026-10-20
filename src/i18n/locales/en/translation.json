@@ -248,6 +248,7 @@
       },
       "acceleration": {
         "currentlyUsing": "Currently using: {{device}}",
+        "pendingSwitch": "Pending switch to {{device}}",
         "currentlyUsingFallback": "Currently using: {{device}} (fallback)",
         "unavailableDevice": "{{device}} (unavailable)",
         "preferredGpu": "Preferred GPU",
@@ -667,6 +668,8 @@
   "errors": {
     "deviceRestoredTitle": "Back on your preferred device",
     "deviceRestoredDescription": "Handy successfully transcribed using {{device}} again. Your preferred device setting has not changed.",
+    "deviceUpgradedTitle": "Transcription upgraded",
+    "deviceUpgradedDescription": "Handy is now using {{device}} for transcription.",
     "deviceFallbackTitle": "Handy switched transcription devices",
     "deviceFallbackDescription": "Handy switched to {{device}} after a transcription device failed. Your preferred device setting has not changed. Handy will automatically check for GPU recovery.",
     "backupCpu": "your computer's CPU",
@@ -703,7 +706,8 @@
   "overlay": {
     "transcribing": "Transcribing...",
     "processing": "Processing...",
-    "loadingModel": "Loading model..."
+    "loadingModel": "Loading model...",
+    "recovering": "Recovering transcription..."
   },
   "secureInput": {
     "blockedWithCulprit_one": "{{name}} may be blocking 1 shortcut",
