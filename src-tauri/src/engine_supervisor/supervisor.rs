@@ -1026,7 +1026,8 @@ impl Owner {
     }
 
     /// Compare the bound device with the original request, preserving the
-    /// saved preference while a temporary replacement is used.
+    /// saved preference while a temporary replacement is used. Auto and
+    /// fallbacks discover available devices without retrying present failures.
     fn update_gpu_recheck(&self, spec: &LoadSpec, info: &LoadedInfo) {
         let fallback = self.shared.gpu_allowed
             && !spec.cpu_only()
@@ -1148,7 +1149,7 @@ impl Owner {
         }
     }
 
-    /// Probe in an isolated, model-less worker when recovery is due. A
+    /// Probe in an isolated, model-less worker when discovery or recovery is due. A
     /// successful enumeration alone never clears a device's failure state:
     /// it must also load the model. Fresh enumeration resolves stable device
     /// identities again because driver restarts can change registry indices.
@@ -1606,6 +1607,18 @@ struct StartFailure {
     device: Option<(String, String)>,
 }
 
+/// Shared system RAM is not comparable to dedicated VRAM. Match upstream's
+/// preference for discrete GPUs before using memory to order peers. Use the
+/// backend's GPU/IGPU classification rather than vendor names. This is a
+/// selection heuristic, not a performance benchmark; stable keys break ties
+/// in the callers so re-enumeration order does not choose the winner.
+fn gpu_rank(device: &DeviceInfo) -> (bool, u64) {
+    (
+        device.device_type == transcribe_cpp::DeviceType::Gpu,
+        device.memory_total,
+    )
+}
+
 /// Keep the requested preference intact while selecting a temporary worker.
 /// Exclude each failed GPU independently, so a failed integrated GPU can fall
 /// back to a healthy dedicated GPU (or vice versa) before strict CPU is needed.
@@ -1637,8 +1650,8 @@ fn select_recovery_spec(
         .find(|device| preferred == Some(&device.key))
         .or_else(|| {
             healthy().max_by(|a, b| {
-                a.memory_total
-                    .cmp(&b.memory_total)
+                gpu_rank(a)
+                    .cmp(&gpu_rank(b))
                     .then_with(|| a.key.cmp(&b.key))
             })
         });
@@ -1667,8 +1680,8 @@ fn upgrade_candidate<'a>(
         .iter()
         .filter(|device| device.is_gpu())
         .max_by(|a, b| {
-            a.memory_total
-                .cmp(&b.memory_total)
+            gpu_rank(a)
+                .cmp(&gpu_rank(b))
                 .then_with(|| a.key.cmp(&b.key))
         });
     let candidate = devices
@@ -1685,7 +1698,7 @@ fn upgrade_candidate<'a>(
             let active = devices
                 .iter()
                 .find(|device| Some(&device.key) == current.device_key.as_ref());
-            if active.is_some_and(|active| active.memory_total >= candidate.memory_total) {
+            if active.is_some_and(|active| gpu_rank(active) >= gpu_rank(candidate)) {
                 return None;
             }
         }

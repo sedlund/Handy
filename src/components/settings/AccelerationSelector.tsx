@@ -58,6 +58,7 @@ export const AccelerationSelector: FC<AccelerationSelectorProps> = ({
   const [transcribeOptions, setTranscribeOptions] = useState<DropdownOption[]>(
     [],
   );
+  const [usableDeviceCount, setUsableDeviceCount] = useState(0);
   const [activeDevice, setActiveDevice] =
     useState<ActiveTranscriptionDevice | null>(null);
   const refreshRef = useRef<() => void>(() => {});
@@ -96,6 +97,12 @@ export const AccelerationSelector: FC<AccelerationSelectorProps> = ({
         if (available.transcribe.includes("cpu")) {
           opts.push({ value: "cpu", label: "CPU" });
         }
+        // Auto is a policy, not an additional physical device. Ignore saved
+        // GPUs that are currently unavailable when deciding whether to explain it.
+        setUsableDeviceCount(
+          available.gpu_devices.filter((device) => device.available).length +
+            Number(available.transcribe.includes("cpu")),
+        );
         setTranscribeOptions(opts);
         setActiveDevice(available.active_device);
       } catch (error) {
@@ -145,6 +152,11 @@ export const AccelerationSelector: FC<AccelerationSelectorProps> = ({
     await updateSetting("transcribe_accelerator", accelerator);
   };
 
+  const showActiveDevice =
+    activeDevice !== null &&
+    (activeDevice.is_fallback ||
+      (currentTranscribe === "auto" && usableDeviceCount > 1));
+
   return (
     <SettingContainer
       title={t("settings.advanced.acceleration.transcribe.title")}
@@ -164,16 +176,25 @@ export const AccelerationSelector: FC<AccelerationSelectorProps> = ({
             isUpdating("transcribe_gpu_device")
           }
         />
-        {activeDevice?.is_fallback && (
+        {showActiveDevice && activeDevice && (
           <p
-            className="max-w-sm text-right text-xs text-amber-600 dark:text-amber-400"
+            className={`max-w-sm text-right text-xs ${
+              activeDevice.is_fallback
+                ? "text-amber-600 dark:text-amber-400"
+                : "text-text/60"
+            }`}
             aria-live="polite"
           >
-            {t("settings.advanced.acceleration.currentlyUsingFallback", {
-              device: activeDevice.on_gpu
-                ? activeDevice.name
-                : t("errors.backupCpu"),
-            })}
+            {t(
+              activeDevice.is_fallback
+                ? "settings.advanced.acceleration.currentlyUsingFallback"
+                : "settings.advanced.acceleration.currentlyUsing",
+              {
+                device: activeDevice.on_gpu
+                  ? activeDevice.name
+                  : t("errors.backupCpu"),
+              },
+            )}
           </p>
         )}
       </div>
